@@ -68,6 +68,8 @@ exit.
 | `WORKER_ASR_BATCH` | clips transcribed at once (default = `WORKER_BATCH`) |
 | `OMNIVOICE_DEVICE` | default `cuda:0` |
 | `WORKER_POLL_SECONDS` | idle poll interval (default 5) |
+| `WORKER_LABEL` | name shown in the app (default: `Colab`, `RunPod …`, or hostname) |
+| `WORKER_ID` | presence row id (default: hostname-pid) |
 
 Measured on an 8 GB card: ASR batch 4 gives 1.52x over sequential, batch 8 only
 1.58x while pushing reserved VRAM from 4.8 to 6.2 GB alongside the TTS model. On
@@ -79,6 +81,7 @@ small cards the extra 0.06x is not worth the OOM risk.
 |---|---|
 | `jobs.status` | `compiling → rendering → qc → assembling → done` |
 | `jobs.qc_summary` | coverage %, cue counts, timing mode, overrun seconds |
+| `render_workers` | presence: is this worker alive, and what is it doing |
 | `jobs.srt_out_path` | corrected `.srt` matching the generated audio |
 | `cues.cer` | fraction of script words **not** spoken — `0.0` is perfect |
 | `cues.status` | `qc_pass`, `review`, `qc_fail`, `condensed` |
@@ -90,3 +93,18 @@ with Whisper, and compared against the script. Cues below 100% are retried up to
 `max_attempts`, keeping the best take. Forcing a clip shorter than its words
 need makes the model drop words rather than speak faster — measured 65% word
 coverage when durations were hard-forced, versus 99%+ when left free.
+
+## Presence — how the app knows the GPU is on
+
+The worker upserts a `render_workers` row every 20 seconds, **including while
+idle**, and writes `stopped` on the way out. That is what drives the engine
+indicator in the app's header: a Colab session that was closed cleanly flips it
+immediately, and one that was killed goes stale instead (75 s idle, 3 minutes
+busy — a long voice encode legitimately blocks the beat).
+
+`jobs.heartbeat_at` cannot substitute for this. It only ticks mid-render, so an
+idle worker and a dead one look identical through it.
+
+Presence is optional. Until the app's `20260815_engine_status.sql` migration has
+been run, the worker prints `engine status off` once and renders exactly as
+before.
