@@ -28,6 +28,8 @@ Other environment:
     WORKER_ASR_BATCH             clips transcribed at once (default = WORKER_BATCH)
     WORKER_RUNTIME_MINUTES       stop claiming new work after N minutes (Colab budget)
     WORKER_POLL_SECONDS          idle poll interval (default 5)
+    WORKER_ID                    presence row id (default: hostname-pid)
+    WORKER_LABEL                 name shown in the web app (default: Colab / RunPod / hostname)
 
 Run:
     python worker.py                       # loop until stopped
@@ -37,6 +39,7 @@ Run:
 
 import argparse
 import os
+import platform
 import re
 import sys
 import tempfile
@@ -165,6 +168,69 @@ def has_column(sb, table, column):
 
 
 _COLS: dict[str, bool] = {}
+
+
+# ----------------------------------------------------------------- presence
+
+# The web app answers "is the render engine on?" from these rows. It has to keep
+# ticking while the queue is empty too: a worker waiting for work is still a GPU
+# that is up and will pick the next job straight away, which is exactly what
+# somebody about to press "Queue render" wants to know.
+BEAT_SECONDS = 20
+
+WORKER_ID = os.environ.get("WORKER_ID") or f"{platform.node() or 'worker'}-{os.getpid()}"
+_beat = {"at": 0.0, "gpu": None, "probed": False, "on": True}
+
+
+def worker_label():
+    if os.environ.get("WORKER_LABEL"):
+        return os.environ["WORKER_LABEL"]
+    if os.environ.get("COLAB_RELEASE_TAG") or os.path.isdir("/content/drive"):
+        return "Colab"
+    if os.environ.get("RUNPOD_POD_ID"):
+        return f"RunPod {os.environ['RUNPOD_POD_ID'][:8]}"
+    return platform.node() or "worker"
+
+
+def gpu_name():
+    """Probe once. torch is already a dependency, so this costs nothing after
+    the first call and gives the UI something better than 'a worker'."""
+    if not _beat["probed"]:
+        _beat["probed"] = True
+        try:
+            import torch
+            if torch.cuda.is_available():
+                _beat["gpu"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+    return _beat["gpu"]
+
+
+def beat(sb, status, job_id=None, detail=None, force=False):
+    """Write this worker's presence row. Rate-limited unless forced.
+
+    Presence must never be the thing that breaks a render, and the table is
+    optional — a project that has not run the engine-status migration keeps
+    working, it just cannot show the indicator. So one failure turns it off for
+    the rest of the session rather than raising on every loop.
+    """
+    if not _beat["on"]:
+        return
+    if not force and time.time() - _beat["at"] < BEAT_SECONDS:
+        return
+    try:
+        sb.table("render_workers").upsert({
+            "id": WORKER_ID, "label": worker_label(), "gpu": gpu_name(),
+            "status": status, "job_id": job_id, "detail": detail,
+            "last_seen_at": now_iso(),
+            "stats": {"jobs": _stats["jobs"], "voices": _stats["voices"],
+                      "cues": _stats["cues"],
+                      "audio_min": round(_stats["audio_s"] / 60, 1)},
+        }).execute()
+        _beat["at"] = time.time()
+    except Exception as e:
+        _beat["on"] = False
+        print(f"  (engine status off — render_workers unavailable: {e})", flush=True)
 
 
 # -------------------------------------------------------------------- model
@@ -357,7 +423,7 @@ def render_job(sb, job):
 
     clips: dict[int, np.ndarray] = {}
     done, review = len(skipped), 0
-    beat = time.time()
+    job_beat = time.time()
 
     for start in range(0, len(speak), BATCH):
         batch = speak[start:start + BATCH]
@@ -422,10 +488,11 @@ def render_job(sb, job):
             }).eq("id", c["id"]).execute()
 
         fields = {"done_cues": done, "review_cues": review}
-        if time.time() - beat > 30 and has_column(sb, "jobs", "heartbeat_at"):
+        if time.time() - job_beat > 30 and has_column(sb, "jobs", "heartbeat_at"):
             fields["heartbeat_at"] = now_iso()
-            beat = time.time()
+            job_beat = time.time()
         set_job(sb, job_id, **fields)
+        beat(sb, "busy", job_id=job_id, detail=f"cue {done}/{len(cues)} — {job['title']}")
 
     # ------------------------------------------------------------ assemble
     set_job(sb, job_id, status="qc")
@@ -567,50 +634,68 @@ def main():
         except Exception as e:
             print(f"(requeue_stalled_jobs unavailable: {e})", flush=True)
 
+    try:
+        sb.rpc("prune_render_workers", {"older_than_hours": 72}).execute()
+    except Exception:
+        pass                      # optional housekeeping, never worth a failure
+
+    beat(sb, "starting", detail="waking up", force=True)
     print(f"worker up — batch {BATCH}/{ASR_BATCH}"
           + (f", budget {args.runtime_minutes:.0f} min" if budget else "")
+          + f" — shows in the web app as '{worker_label()}'"
           + " (Ctrl+C to stop)", flush=True)
 
     idle = 0
-    while True:
-        if budget and time.time() - t0 > budget:
-            print("\nruntime budget reached — stopping cleanly", flush=True)
-            break
-        refresh_auth(sb)
+    try:
+        while True:
+            if budget and time.time() - t0 > budget:
+                print("\nruntime budget reached — stopping cleanly", flush=True)
+                break
+            refresh_auth(sb)
 
-        voice = claim_next_voice(sb)
-        if voice is not None:
-            idle = 0
-            try:
-                process_voice(sb, voice)
-            except Exception as e:
-                traceback.print_exc()
-                sb.table("voices").update({"status": "failed", "error": str(e)[:500]}) \
-                    .eq("id", voice["id"]).execute()
-            continue
+            voice = claim_next_voice(sb)
+            if voice is not None:
+                idle = 0
+                beat(sb, "busy", detail=f"building voice {voice['name']}", force=True)
+                try:
+                    process_voice(sb, voice)
+                except Exception as e:
+                    traceback.print_exc()
+                    sb.table("voices").update({"status": "failed", "error": str(e)[:500]}) \
+                        .eq("id", voice["id"]).execute()
+                continue
 
-        job = claim_next_job(sb)
-        if job is not None:
-            idle = 0
-            print(f"\n=== job {job['id']} — {job['title']} ===", flush=True)
-            jt = time.time()
-            try:
-                render_job(sb, job)
-                print(f"=== done in {time.time()-jt:.0f}s ===", flush=True)
-            except Exception as e:
-                traceback.print_exc()
-                set_job(sb, job["id"], status="failed", error=str(e)[:500])
-                log(sb, job, "failed", str(e)[:300])
-            print_stats(t0)
-            continue
+            job = claim_next_job(sb)
+            if job is not None:
+                idle = 0
+                print(f"\n=== job {job['id']} — {job['title']} ===", flush=True)
+                beat(sb, "busy", job_id=job["id"], detail=job["title"], force=True)
+                jt = time.time()
+                try:
+                    render_job(sb, job)
+                    print(f"=== done in {time.time()-jt:.0f}s ===", flush=True)
+                except Exception as e:
+                    traceback.print_exc()
+                    set_job(sb, job["id"], status="failed", error=str(e)[:500])
+                    log(sb, job, "failed", str(e)[:300])
+                print_stats(t0)
+                continue
 
-        if args.once:
-            print("both queues empty — exiting")
-            break
-        idle += 1
-        if idle % 12 == 1:
-            print("  ...idle", flush=True)
-        time.sleep(POLL)
+            if args.once:
+                print("both queues empty — exiting")
+                break
+            idle += 1
+            if idle % 12 == 1:
+                print("  ...idle", flush=True)
+            beat(sb, "idle", detail="waiting for work")
+            time.sleep(POLL)
+    except KeyboardInterrupt:
+        print("\nstopped by hand", flush=True)
+    finally:
+        # Say goodbye rather than letting the row go stale: the indicator in the
+        # web app then flips to "off" the moment the Colab cell ends, instead of
+        # a minute later.
+        beat(sb, "stopped", detail=None, force=True)
 
     print_stats(t0)
 
