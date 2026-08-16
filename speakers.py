@@ -93,6 +93,12 @@ def _plausible(label: str) -> bool:
         return False
     if _fold(label) in PROSE_LEADS:
         return False
+    # An unbalanced bracket means this is a fragment of a caption whose colon
+    # happened to land mid-way — "(Kim Hyun Soo: đã bị bắt" would cast
+    # "(Kim Hyun Soo" as a character. Balanced pairs stay legal ("MINH (VO)").
+    for open_ch, close_ch in ("()", "[]", "{}"):
+        if label.count(open_ch) != label.count(close_ch):
+            return False
     # A label of many words is a sentence, not a name. Vietnamese names run to
     # four syllables ("Nguyễn Thị Bích Ngọc"), so allow up to five words.
     if len(label.split()) > 5:
