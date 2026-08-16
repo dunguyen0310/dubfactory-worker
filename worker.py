@@ -528,10 +528,21 @@ def mux_video(sb, job, work, dub_wav):
 def render_job(sb, job):
     job_id, owner = job["id"], job["owner_id"]
     settings = job.get("settings") or {}
+    kind = job.get("kind") or "subtitles"     # subtitles | video | tts
     read_captions = bool(settings.get("read_caption_cues", False))
     timing_mode = settings.get("timing_mode", "natural")      # natural | fit
     language = settings.get("language", "Vietnamese")
     max_attempts = int(settings.get("max_attempts", 4))
+
+    # A text-to-speech job is prose, not subtitles. Two subtitle conventions
+    # actively damage it and are switched off:
+    #   * caption skipping would silently drop a paragraph that happens to be
+    #     wholly parenthesised — "(See appendix A.)" is content in a document;
+    #   * fit-to-timecode has nothing to fit to, since the timestamps are
+    #     estimates this pipeline generated rather than an edit to honour.
+    if kind == "tts":
+        read_captions = True
+        timing_mode = "natural"
 
     work = Path(tempfile.mkdtemp(prefix=f"job_{job_id[:8]}_"))
     set_job(sb, job_id, status="compiling")
@@ -717,7 +728,11 @@ def render_job(sb, job):
         clip = clips.get(c["idx"])
         if clip is None:
             continue
-        start_s = max(c["start_ms"] / 1000.0, cursor)
+        # A subtitle cue starts at its timestamp, or later if the previous clip
+        # is still running. A read-aloud has no timestamps worth honouring —
+        # they were estimated from the text — so its clips simply follow one
+        # another at the cursor and the paragraph rhythm comes from the writing.
+        start_s = cursor if kind == "tts" else max(c["start_ms"] / 1000.0, cursor)
         cursor = start_s + clip.size / SR + S.GAP
         placed.append((c, clip, start_s))
 
@@ -774,10 +789,15 @@ def render_job(sb, job):
         "cues_total": len(cues), "cues_spoken": len(placed),
         "cues_skipped": len(skipped), "cues_needing_review": review,
         "timing_mode": timing_mode, "speed_applied": round(speed, 3),
-        "audio_seconds": round(end, 2), "srt_seconds": round(srt_end, 2),
-        "overrun_seconds": round(max(0.0, end - srt_end), 2),
-        "voice": vrow["name"],
+        "audio_seconds": round(end, 2),
+        "voice": vrow["name"], "kind": kind,
     }
+    # Only a job with a real timecode can overrun it. For a read-aloud the
+    # "srt seconds" would just be this pipeline's own estimate, and reporting
+    # the audio as running over its own guess is noise, not information.
+    if kind != "tts":
+        qc["srt_seconds"] = round(srt_end, 2)
+        qc["overrun_seconds"] = round(max(0.0, end - srt_end), 2)
 
     # Casting is worth recording per job: "which voice played whom" is the first
     # thing anyone asks when a rendered episode sounds wrong.

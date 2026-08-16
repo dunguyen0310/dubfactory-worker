@@ -126,6 +126,23 @@ Presence is optional. Until the app's `20260815_engine_status.sql` migration has
 been run, the worker prints `engine status off` once and renders exactly as
 before.
 
+## Job kinds
+
+`jobs.kind` says which flow created a job, and the worker branches on it.
+
+| kind | in | out |
+|---|---|---|
+| `subtitles` | an `.srt` | `dub.wav` + a corrected `.srt` |
+| `video` | a video and its `.srt` | `dubbed.mp4` |
+| `tts` | typed or uploaded text | audio |
+
+A `tts` job is prose, not subtitles, so two subtitle conventions are switched
+off for it — one of which loses text. Caption skipping would silently drop a
+paragraph that happens to be wholly parenthesised, and `(See appendix A.)` is
+content in a document. Fit-to-timecode is refused too: a reading has no edit to
+honour, only the estimates this pipeline generated, so its clips simply follow
+one another and the rhythm comes from the paragraph breaks in the writing.
+
 ## The tools it renders with
 
 Each runs standalone as well as inside the worker, which is how they are tested.
