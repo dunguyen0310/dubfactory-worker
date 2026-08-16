@@ -19,6 +19,16 @@ browser ──▶ Supabase ◀── worker (here)
 pip install "omnivoice[tn]" supabase
 ```
 
+Optional extras, each enabling one feature and each degrading politely when
+absent — a job that asks for one still renders, and says in its log why the
+step was skipped:
+
+```bash
+pip install google-genai      # or `anthropic` — rewrites over-long lines
+pip install demucs            # removes the original voices from a video
+apt-get install -y ffmpeg     # required for video jobs at all
+```
+
 `[tn]` is text normalisation. It needs `pynini`, which has no Windows wheels but
 installs fine on Linux — without it, numbers are read as digits rather than
 words ("thứ 8" comes out as "thứ tư").
@@ -49,6 +59,13 @@ unless the account is registered in `worker_accounts` (see
 `migrations/20260815_shared_voice_library.sql`).
 
 ## Run
+
+Adaptation needs an API key on the worker; without one the job renders the
+original text rather than failing:
+
+```bash
+export GEMINI_API_KEY="AIza..."         # or ANTHROPIC_API_KEY
+```
 
 ```bash
 python worker.py                        # loop until stopped
@@ -108,3 +125,20 @@ idle worker and a dead one look identical through it.
 Presence is optional. Until the app's `20260815_engine_status.sql` migration has
 been run, the worker prints `engine status off` once and renders exactly as
 before.
+
+## The tools it renders with
+
+Each runs standalone as well as inside the worker, which is how they are tested.
+
+| | |
+|---|---|
+| `speakers.py` | Finds the cast in a subtitle file — `MINH:`, `[MINH]`, italics for narration. Detection never edits the script: only the label name is recorded, and it is stripped at render time, so a wrong guess is undone by clearing it. |
+| `adapt_srt.py` | Rewrites lines with more syllables than their slot can hold — the root cause of both dropped words and rushed audio. `--dry-run` reports the fit with no API key at all. |
+| `video_dub.py` | Lays the dub over the source video, keeping the music and effects and ducking them under the new voice. |
+| `srt_dub.py` | The original one-shot CLI: subtitles plus a reference clip in, dub out. |
+
+```bash
+python speakers.py episode.srt --show-lines
+python adapt_srt.py --srt episode.srt --dry-run
+python video_dub.py --video ep.mp4 --dub dub.wav --output ep_vn.mp4
+```
