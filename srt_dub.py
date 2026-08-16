@@ -52,6 +52,11 @@ class Cue:
     start: float
     end: float
     text: str
+    # The cue exactly as written, markup included. `text` has tags stripped
+    # because that is what gets spoken, but the tags carry meaning of their own
+    # — subtitlers use <i> for narration and phone audio — and speakers.py needs
+    # them. Defaulted so the four-argument constructor keeps working.
+    raw: str = ""
 
     @property
     def slot(self) -> float:
@@ -78,9 +83,10 @@ def parse_srt(path: str) -> list[Cue]:
         h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in m.groups())
         start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
         end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
-        text = TAG_RE.sub("", " ".join(lines[text_start:])).strip()
+        raw = " ".join(lines[text_start:]).strip()
+        text = TAG_RE.sub("", raw).strip()
         if text and end > start:
-            cues.append(Cue(len(cues) + 1, start, end, text))
+            cues.append(Cue(len(cues) + 1, start, end, text, raw))
     cues.sort(key=lambda c: c.start)
     return cues
 

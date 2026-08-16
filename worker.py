@@ -38,9 +38,11 @@ Run:
 """
 
 import argparse
+import io
 import os
 import platform
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -51,6 +53,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+import speakers as SPK
 import srt_dub as S
 import voice_lib as VL
 
@@ -119,19 +122,36 @@ def get_client():
     return sb
 
 
-def refresh_auth(sb):
-    """Re-sign-in before the JWT expires. A dub run lasts hours; the default
-    access token does not."""
+# Supabase access tokens last an hour. Refreshing at half that leaves room for
+# one failed attempt and a slow retry before anything actually expires.
+TOKEN_MAX_AGE = 30 * 60
+
+
+def refresh_auth(sb, force: bool = False):
+    """Re-sign-in before the JWT expires.
+
+    Must be called from inside a render, not only between jobs. A 400-cue
+    episode takes about an hour, which is exactly the token's lifetime — one
+    was lost after all 411 cues had rendered, three minutes into uploading the
+    result, to `"exp" claim timestamp check failed`. Every second of that GPU
+    time was already spent.
+
+    Cheap to call often: it returns immediately unless the token is old.
+    """
     if not _auth["email"]:
-        return
-    if time.time() - _auth["at"] < 40 * 60:
+        return                      # service_role key — never expires
+    age = time.time() - _auth["at"]
+    if not force and age < TOKEN_MAX_AGE:
         return
     try:
         sb.auth.sign_in_with_password({"email": _auth["email"],
                                        "password": _auth["password"]})
         _auth["at"] = time.time()
+        print(f"  (auth token refreshed after {age / 60:.0f} min)", flush=True)
     except Exception as e:
-        print(f"  (token refresh failed: {e})", flush=True)
+        # Leave _auth["at"] alone so the next call tries again rather than
+        # waiting another full interval on a token that is already stale.
+        print(f"  (token refresh failed, will retry: {e})", flush=True)
 
 
 def now_iso():
@@ -249,6 +269,15 @@ def get_model():
     return _model
 
 
+# Whisper's feature extractor cannot build a spectrogram from silence shorter
+# than one frame; handed a zero-length array it raises
+#   cannot reshape tensor of 0 elements into shape [-1, 0]
+# which used to escape render_job and fail the whole episode. Generation does
+# occasionally return no samples — a cue whose text has nothing pronounceable in
+# it ("...") reproduces it every time — so this has to be handled, not avoided.
+MIN_ASR_SAMPLES = SR // 20        # 50 ms; below this there is nothing to hear
+
+
 def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
     """Transcribe a list of clips, batched through the underlying HF pipeline.
 
@@ -256,23 +285,45 @@ def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
     a list, which keeps the GPU busy instead of paying per-call overhead on
     every short cue. Falls back to one-at-a-time if anything about the batched
     path fails, since verification must never be the thing that breaks a job.
+
+    Clips too short to transcribe come back as "" rather than raising. That is
+    the honest answer — nothing was said — and it flows through coverage() as
+    0% spoken, so the cue is retried like any other bad take instead of taking
+    the episode down with it.
     """
     if not clips:
         return []
+
+    sayable = [i for i, c in enumerate(clips) if c.size >= MIN_ASR_SAMPLES]
+    texts = [""] * len(clips)
+    if len(sayable) != len(clips):
+        print(f"  ({len(clips) - len(sayable)} clip(s) too short to transcribe "
+              f"— counted as nothing spoken)", flush=True)
+    if not sayable:
+        return texts
+
+    batch = [clips[i].astype(np.float32) for i in sayable]
     try:
-        inputs = [{"array": c.astype(np.float32), "sampling_rate": SR} for c in clips]
+        inputs = [{"array": c, "sampling_rate": SR} for c in batch]
         out = model._asr_pipe(inputs, batch_size=max(1, ASR_BATCH))
         if isinstance(out, dict):
             out = [out]
-        return [str(o["text"]).strip() for o in out]
+        for i, o in zip(sayable, out):
+            texts[i] = str(o["text"]).strip()
+        return texts
     except Exception as e:
         print(f"  (batched ASR unavailable, falling back: {e})", flush=True)
-        import torch
-        texts = []
-        for c in clips:
-            t = model.transcribe((torch.from_numpy(c), SR))
-            texts.append(str(t[0] if isinstance(t, (list, tuple)) else t).strip())
-        return texts
+
+    import torch
+    for i in sayable:
+        # One clip failing to transcribe must not lose the verification for the
+        # rest of the batch — an empty transcript just means "retry this cue".
+        try:
+            t = model.transcribe((torch.from_numpy(clips[i]), SR))
+            texts[i] = str(t[0] if isinstance(t, (list, tuple)) else t).strip()
+        except Exception as e:
+            print(f"  (clip {i} could not be transcribed: {e})", flush=True)
+    return texts
 
 
 # ------------------------------------------------------------ voice library
@@ -384,13 +435,162 @@ def get_voice_prompt(sb, vrow, workdir: Path):
 
 # ------------------------------------------------------------------ render
 
+def cue_text(c) -> str:
+    """What to speak for a cue.
+
+    Two layers sit between the uploaded line and the spoken one, and both are
+    resolved here so that generation, ASR verification and the emitted .srt can
+    never disagree about what was said:
+
+      * adaptation writes its rewrite to final_text, leaving source_text as the
+        untouched record of what was uploaded;
+      * casting stores the character in `speaker` and leaves its label in the
+        text, so the label is removed at render time rather than at upload —
+        clearing a wrongly-detected speaker restores the whole line.
+    """
+    text = (c.get("final_text") or "").strip() or c["source_text"]
+    return SPK.strip_label(text, c.get("speaker"))
+
+
+def resolve_voice(c, default_voice_id):
+    """Which voice speaks this cue — its cast voice, else the job's."""
+    return c.get("voice_id") or default_voice_id
+
+
+def adapt_cues(sb, job, cues, language, settings):
+    """Rewrite over-long lines to fit their slots, before any GPU time is spent.
+
+    Only cues without a final_text are considered, so re-rendering a job does
+    not pay for the same rewrites twice — and a cue whose text was edited in
+    the UI (which clears final_text) is re-adapted with its new wording.
+    """
+    import adapt_srt as A
+
+    pending = [c for c in cues if not (c.get("final_text") or "").strip()]
+    if not pending:
+        return
+    probes = [S.Cue(c["idx"], c["start_ms"] / 1000.0, c["end_ms"] / 1000.0,
+                    c["source_text"]) for c in pending]
+    syl = float(settings.get("syllables_per_sec", S.SYLLABLES_PER_SEC))
+    tol = float(settings.get("adapt_tolerance", A.DEFAULT_TOLERANCE))
+    rows, targets = A.analyse(probes, syl, tol)
+    over = sum(1 for r in rows if r["over"])
+    if not targets:
+        log(sb, job, "adapting",
+            f"All {len(probes)} line(s) already fit their slots — nothing to rewrite")
+        return
+
+    log(sb, job, "adapting",
+        f"{len(targets)} of {len(probes)} line(s) need shortening or "
+        f"number-spelling ({over} over budget)")
+    try:
+        new_text = A.adapt(
+            probes, targets, language=language,
+            provider=settings.get("adapt_provider", "auto"),
+            model=settings.get("adapt_model"),
+            syllables_per_sec=syl,
+            log=lambda m: print(f"  [adapting] {m}", flush=True))
+    except (A.NoCredentials, A.BadModel) as e:
+        # Never fail a render over this: the original text still speaks, it
+        # just may overrun. Surface it so staff know why nothing was rewritten.
+        log(sb, job, "adapting", f"Skipped — {str(e).splitlines()[0]}")
+        return
+    except Exception as e:
+        log(sb, job, "adapting", f"Skipped after an error: {str(e)[:200]}")
+        return
+
+    by_idx = {c["idx"]: c for c in pending}
+    for idx, text in new_text.items():
+        row = by_idx.get(idx)
+        if row is not None:
+            sb.table("cues").update({"final_text": text}).eq("id", row["id"]).execute()
+            row["final_text"] = text
+
+    after, _ = A.analyse(
+        [S.Cue(c["idx"], c["start_ms"] / 1000.0, c["end_ms"] / 1000.0, cue_text(c))
+         for c in pending], syl, tol)
+    summary = {
+        "lines_considered": len(probes),
+        "lines_over_budget": over,
+        "lines_rewritten": len(new_text),
+        "worst_ratio_before": round(max((r["ratio"] for r in rows), default=0), 2),
+        "worst_ratio_after": round(max((r["ratio"] for r in after), default=0), 2),
+        "still_over_budget": sum(1 for r in after if r["over"]),
+        "language": language,
+    }
+    log(sb, job, "adapting",
+        f"Rewrote {len(new_text)} line(s); worst fit "
+        f"{summary['worst_ratio_before']}x -> {summary['worst_ratio_after']}x",
+        summary)
+    if has_column(sb, "jobs", "adapt_summary"):
+        set_job(sb, job["id"], adapt_summary=summary)
+
+
+def mux_video(sb, job, work, dub_wav):
+    """Lay the finished dub over the source video, keeping music and effects.
+
+    Returns the storage path of the dubbed MP4, or None when the job has no
+    video or the mux could not run. A failure here never fails the job — the
+    dub.wav is already uploaded and usable on its own.
+    """
+    video_path = job.get("video_path")
+    if not video_path:
+        return None
+    if not shutil.which("ffmpeg"):
+        log(sb, job, "muxing", "Skipped — ffmpeg is not installed on this worker")
+        return None
+
+    import video_dub as V
+
+    job_id, owner = job["id"], job["owner_id"]
+    settings = job.get("settings") or {}
+    set_job(sb, job_id, status="muxing")
+    log(sb, job, "muxing", "Building the dubbed video")
+
+    local_video = work / ("source" + Path(video_path).suffix.lower())
+    local_video.write_bytes(sb.storage.from_("videos").download(video_path))
+
+    out_mp4 = work / "dubbed.mp4"
+    info = V.mux_dub(
+        str(local_video), str(dub_wav), str(out_mp4),
+        duck_db=settings.get("duck_db"),
+        separate=bool(settings.get("separate_voices", True)),
+        log=lambda m: print(f"  [muxing] {m}", flush=True),
+    )
+
+    mp4_path = f"{owner}/{job_id}/dubbed.mp4"
+    sb.storage.from_("outputs").upload(
+        mp4_path, out_mp4.read_bytes(),
+        {"content-type": "video/mp4", "upsert": "true"})
+    if info["separated"]:
+        note = "Music and effects kept, original voices removed"
+    elif not settings.get("separate_voices", True):
+        note = "Original mix ducked under the dub (separation turned off for this job)"
+    else:
+        note = ("Original mix ducked under the dub — install Demucs on the "
+                "worker to remove the original voices")
+    log(sb, job, "muxing", note, info)
+    return mp4_path, info
+
+
 def render_job(sb, job):
     job_id, owner = job["id"], job["owner_id"]
     settings = job.get("settings") or {}
+    kind = job.get("kind") or "subtitles"     # subtitles | video | tts
     read_captions = bool(settings.get("read_caption_cues", False))
     timing_mode = settings.get("timing_mode", "natural")      # natural | fit
     language = settings.get("language", "Vietnamese")
     max_attempts = int(settings.get("max_attempts", 4))
+
+    # A text-to-speech job is prose, not subtitles. Two subtitle conventions
+    # actively damage it and are switched off:
+    #   * caption skipping would silently drop a paragraph that happens to be
+    #     wholly parenthesised — "(See appendix A.)" is content in a document;
+    #   * fit-to-timecode has nothing to fit to, since the timestamps are
+    #     estimates this pipeline generated rather than an edit to honour.
+    if kind == "tts":
+        read_captions = True
+        timing_mode = "natural"
 
     work = Path(tempfile.mkdtemp(prefix=f"job_{job_id[:8]}_"))
     set_job(sb, job_id, status="compiling")
@@ -415,18 +615,96 @@ def render_job(sb, job):
     if skipped:
         log(sb, job, "compiling", f"Skipped {len(skipped)} caption cue(s)")
 
-    prompt, ref_timbre = get_voice_prompt(sb, vrow, work)
-    model = get_model()
+    # Adaptation runs before any GPU time is spent: a line rewritten to fit its
+    # slot never has to be rescued later by dropping words or crushing audio.
+    if settings.get("adapt_text"):
+        set_job(sb, job_id, status="adapting")
+        adapt_cues(sb, job, speak, language, settings)
 
-    set_job(sb, job_id, status="rendering", total_cues=len(cues), done_cues=len(skipped))
-    log(sb, job, "rendering", f"Rendering {len(speak)} cue(s) as {vrow['name']}")
+    # A requeued job keeps its finished takes. Only re-rolled cues, cues that
+    # never rendered, and cues whose stored clip cannot be fetched are
+    # regenerated; on a first render every cue is pending with no audio, so
+    # this partition degenerates to "render everything".
+    todo, reuse = [], []
+    for c in speak:
+        if c.get("status") == "rerolled" or not c.get("audio_path"):
+            todo.append(c)
+        else:
+            reuse.append(c)
 
     clips: dict[int, np.ndarray] = {}
-    done, review = len(skipped), 0
+    for c in list(reuse):
+        try:
+            blob = sb.storage.from_("outputs").download(c["audio_path"])
+            wav, _ = sf.read(io.BytesIO(blob), dtype="float32", always_2d=False)
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            clips[c["idx"]] = wav
+        except Exception as e:
+            print(f"  cue {c['idx']}: stored clip unreadable ({e}) — re-rendering",
+                  flush=True)
+            reuse.remove(c)
+            todo.append(c)
+    todo.sort(key=lambda x: x["idx"])
+
+    # Casting: each character may have its own voice, falling back to the job's.
+    # Cues are grouped by voice and rendered a group at a time — a batch shares
+    # one clone prompt, so mixing voices inside a batch is not an option, and
+    # grouping also means each voice is encoded once rather than per batch.
+    by_voice: dict[str, list] = {}
+    for c in todo:
+        by_voice.setdefault(resolve_voice(c, job["voice_id"]), []).append(c)
+
+    voices = {}
+    if todo:
+        model = get_model()
+        for vid in by_voice:
+            row = (vrow if vid == job["voice_id"] else
+                   sb.table("voices").select("*").eq("id", vid).single().execute().data)
+            if not row.get("consent_confirmed"):
+                raise RuntimeError(
+                    f"cast voice {row.get('name', vid)!r} has no consent on record")
+            voices[vid] = (row, *get_voice_prompt(sb, row, work))
+
+    done = len(skipped) + len(reuse)
+    review = sum(1 for c in reuse if c.get("status") in ("review", "qc_fail"))
+    set_job(sb, job_id, status="rendering", total_cues=len(cues), done_cues=done,
+            review_cues=review)
+    if reuse:
+        log(sb, job, "rendering",
+            f"Re-render: generating {len(todo)} cue(s), keeping "
+            f"{len(reuse)} finished take(s)")
+    elif len(by_voice) > 1:
+        cast = ", ".join(f"{voices[v][0]['name']} ({len(cs)})"
+                         for v, cs in by_voice.items())
+        log(sb, job, "rendering",
+            f"Rendering {len(todo)} cue(s) across {len(by_voice)} voices: {cast}")
+    else:
+        log(sb, job, "rendering", f"Rendering {len(todo)} cue(s) as {vrow['name']}")
+
     job_beat = time.time()
 
-    for start in range(0, len(speak), BATCH):
-        batch = speak[start:start + BATCH]
+    # Batches are cut per voice group rather than across a flat list, so a batch
+    # can never straddle two voices — slicing a flat list and trimming at the
+    # boundary would silently skip whatever was trimmed off.
+    batches = [(vid, group[i:i + BATCH])
+               for vid, group in by_voice.items()
+               for i in range(0, len(group), BATCH)]
+    # Silently dropping cues is exactly the failure this grouping guards
+    # against, so check it rather than assert it — asserts vanish under -O.
+    planned = sum(len(b) for _, b in batches)
+    if planned != len(todo):
+        raise RuntimeError(
+            f"batching lost cues: planned {planned} of {len(todo)}")
+
+    failed_batches = 0
+    for voice_id, batch in batches:
+        # Renew the token before the batch, not after: this batch is about to
+        # upload a dozen clips, and an episode outlives its access token.
+        # Rate-limited internally, so calling it every batch costs nothing.
+        refresh_auth(sb)
+
+        _, prompt, ref_timbre = voices[voice_id]
         best = {c["id"]: None for c in batch}
         pending = list(batch)
 
@@ -434,19 +712,31 @@ def render_job(sb, job):
             kw = {"language": language}
             if attempt > 1:
                 kw["duration"] = [
-                    S.natural_estimate(c["source_text"]) * (1 + 0.1 * (attempt - 1)) / S.OVERSHOOT
+                    S.natural_estimate(cue_text(c)) * (1 + 0.1 * (attempt - 1)) / S.OVERSHOOT
                     for c in pending
                 ]
-            outs = model.generate(
-                text=[c["source_text"] for c in pending],
-                voice_clone_prompt=[prompt] * len(pending), **kw,
-            )
-            wavs = [np.asarray(a, dtype=np.float32).squeeze() for a in outs]
-            heard = transcribe_many(model, wavs)
+            # An episode is hours of GPU time. Losing all of it because one
+            # batch raised is the expensive failure, so a batch that breaks is
+            # abandoned and its cues flagged, while everything already rendered
+            # is kept and the job goes on to finish.
+            try:
+                outs = model.generate(
+                    text=[cue_text(c) for c in pending],
+                    voice_clone_prompt=[prompt] * len(pending), **kw,
+                )
+                wavs = [np.asarray(a, dtype=np.float32).squeeze() for a in outs]
+                heard = transcribe_many(model, wavs)
+            except Exception as e:
+                failed_batches += 1
+                traceback.print_exc()
+                log(sb, job, "rendering",
+                    f"Cue(s) {[c['idx'] for c in pending]} could not be "
+                    f"rendered and were skipped: {str(e)[:160]}")
+                break
 
             still = []
             for c, wav, txt in zip(pending, wavs, heard):
-                cov, missing, tonal = S.coverage(c["source_text"], txt)
+                cov, missing, tonal = S.coverage(cue_text(c), txt)
                 sim = S.cosine(ref_timbre, S.timbre_vector(wav))
                 prev = best[c["id"]]
                 if prev is None or (cov, sim) > (prev[1], prev[2]):
@@ -458,7 +748,32 @@ def render_job(sb, job):
                 break
 
         for c in batch:
-            wav, cov, sim, missing, tonal = best[c["id"]]
+            take = best[c["id"]]
+            # No take at all — the batch broke before producing one. Flag the
+            # cue so it shows up for re-roll and carry on with the episode.
+            if take is None:
+                review += 1
+                done += 1
+                sb.table("cues").update({
+                    "status": "qc_fail", "cer": 1.0, "audio_path": None,
+                    "rendered_ms": 0, "final_text": cue_text(c),
+                    "note": "render failed — re-roll this line",
+                }).eq("id", c["id"]).execute()
+                continue
+
+            wav, cov, sim, missing, tonal = take
+            # A zero-length take is silence, not audio: keeping it would write an
+            # empty clip and place a 0s hole in the timeline.
+            if wav.size == 0:
+                review += 1
+                done += 1
+                sb.table("cues").update({
+                    "status": "qc_fail", "cer": 1.0, "audio_path": None,
+                    "rendered_ms": 0, "final_text": cue_text(c),
+                    "note": "model produced no audio — re-roll, or reword this line",
+                }).eq("id", c["id"]).execute()
+                continue
+
             clips[c["idx"]] = wav
             _stats["cues"] += 1
             _stats["audio_s"] += wav.size / SR
@@ -484,7 +799,7 @@ def render_job(sb, job):
             sb.table("cues").update({
                 "status": status, "cer": cer, "audio_path": path,
                 "rendered_ms": int(wav.size / SR * 1000),
-                "final_text": c["source_text"], "note": note,
+                "final_text": cue_text(c), "note": note,
             }).eq("id", c["id"]).execute()
 
         fields = {"done_cues": done, "review_cues": review}
@@ -495,6 +810,10 @@ def render_job(sb, job):
         beat(sb, "busy", job_id=job_id, detail=f"cue {done}/{len(cues)} — {job['title']}")
 
     # ------------------------------------------------------------ assemble
+    # Everything from here is uploads — the dub, the .srt, maybe a video — and
+    # it is the most expensive possible moment to be told the token expired,
+    # because the whole episode is already rendered. Start it on a fresh one.
+    refresh_auth(sb, force=True)
     set_job(sb, job_id, status="qc")
     log(sb, job, "qc", f"{done - review}/{done} cues passed verification")
     set_job(sb, job_id, status="assembling")
@@ -502,9 +821,13 @@ def render_job(sb, job):
     placed, cursor = [], 0.0
     for c in sorted(speak, key=lambda x: x["idx"]):
         clip = clips.get(c["idx"])
-        if clip is None:
+        if clip is None or clip.size == 0:
             continue
-        start_s = max(c["start_ms"] / 1000.0, cursor)
+        # A subtitle cue starts at its timestamp, or later if the previous clip
+        # is still running. A read-aloud has no timestamps worth honouring —
+        # they were estimated from the text — so its clips simply follow one
+        # another at the cursor and the paragraph rhythm comes from the writing.
+        start_s = cursor if kind == "tts" else max(c["start_ms"] / 1000.0, cursor)
         cursor = start_s + clip.size / SR + S.GAP
         placed.append((c, clip, start_s))
 
@@ -542,11 +865,12 @@ def render_job(sb, job):
               "done_cues": done, "review_cues": review}
 
     # Natural-mode audio runs longer than the source subtitles, so a corrected
-    # .srt is what makes the result usable in an editor.
+    # .srt is what makes the result usable in an editor. It carries the spoken
+    # wording, which after adaptation is not the uploaded wording.
     if has_column(sb, "jobs", "srt_out_path"):
         lines = []
         for n, (c, a, b) in enumerate(final_times, 1):
-            lines.append(f"{n}\n{S.fmt_ts(a)} --> {S.fmt_ts(b)}\n{c['source_text']}\n")
+            lines.append(f"{n}\n{S.fmt_ts(a)} --> {S.fmt_ts(b)}\n{cue_text(c)}\n")
         srt_path = f"{owner}/{job_id}/dub.srt"
         sb.storage.from_("outputs").upload(
             srt_path, ("\n".join(lines)).encode("utf-8"),
@@ -555,15 +879,56 @@ def render_job(sb, job):
 
     cer_rows = sb.table("cues").select("cer").eq("job_id", job_id).execute().data
     cers = [r["cer"] for r in cer_rows if r.get("cer") is not None]
-    fields["qc_summary"] = {
+    qc = {
         "word_coverage": round((1 - float(np.mean(cers))) * 100, 2) if cers else 0.0,
         "cues_total": len(cues), "cues_spoken": len(placed),
         "cues_skipped": len(skipped), "cues_needing_review": review,
         "timing_mode": timing_mode, "speed_applied": round(speed, 3),
-        "audio_seconds": round(end, 2), "srt_seconds": round(srt_end, 2),
-        "overrun_seconds": round(max(0.0, end - srt_end), 2),
-        "voice": vrow["name"],
+        "audio_seconds": round(end, 2),
+        "voice": vrow["name"], "kind": kind,
     }
+    if failed_batches:
+        # The episode finished, but not all of it rendered. Say so on the job
+        # rather than letting a quietly shorter dub look like a clean run.
+        qc["failed_batches"] = failed_batches
+        log(sb, job, "qc",
+            f"{failed_batches} batch(es) failed to render; those cues are "
+            f"flagged for re-roll and are silent in the mix")
+    # Only a job with a real timecode can overrun it. For a read-aloud the
+    # "srt seconds" would just be this pipeline's own estimate, and reporting
+    # the audio as running over its own guess is noise, not information.
+    if kind != "tts":
+        qc["srt_seconds"] = round(srt_end, 2)
+        qc["overrun_seconds"] = round(max(0.0, end - srt_end), 2)
+
+    # Casting is worth recording per job: "which voice played whom" is the first
+    # thing anyone asks when a rendered episode sounds wrong.
+    cast_rows = {}
+    for c in speak:
+        who = c.get("speaker")
+        if who:
+            cast_rows.setdefault(who, {"lines": 0, "voice": None})["lines"] += 1
+            vid = resolve_voice(c, job["voice_id"])
+            if vid in voices:
+                cast_rows[who]["voice"] = voices[vid][0]["name"]
+    if cast_rows:
+        qc["cast"] = cast_rows
+        qc["voices_used"] = len(by_voice)
+
+    # The dub is uploaded and the job is already deliverable; muxing is a bonus
+    # pass, so a failure here downgrades the result rather than losing it.
+    if job.get("video_path") and has_column(sb, "jobs", "mp4_path"):
+        try:
+            muxed = mux_video(sb, job, work, out_wav)
+            if muxed:
+                fields["mp4_path"], mux_info = muxed
+                qc["video"] = mux_info
+        except Exception as e:
+            traceback.print_exc()
+            log(sb, job, "muxing",
+                f"Video mux failed, audio is still complete: {str(e)[:200]}")
+
+    fields["qc_summary"] = qc
     set_job(sb, job_id, **fields)
     _stats["jobs"] += 1
     log(sb, job, "done",
