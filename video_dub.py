@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -74,11 +75,17 @@ def extract_audio(video: str, out_wav: Path) -> bool:
     return proc.returncode == 0 and out_wav.exists() and out_wav.stat().st_size > 44
 
 
-def separate_bed(orig_wav: Path, workdir: Path, log=print):
+def separate_bed(orig_wav: Path, workdir: Path, log=print, tick=None):
     """Demucs two-stem split; returns the music+SFX bed, or None if unavailable.
 
     Runs the demucs CLI in a subprocess rather than importing an API: the CLI
     is stable across every released version, the api module is not.
+
+    `tick`, if given, is called every few seconds while Demucs runs. A full
+    episode separates for many silent minutes, and the caller may need to
+    prove it is still alive during them — the worker's stall sweep requeues
+    any job quiet for 15, and handing a live separation to a second worker
+    would render the same episode twice.
     """
     if importlib.util.find_spec("demucs") is None:
         log("Demucs not installed — ducking the full original mix instead "
@@ -87,12 +94,21 @@ def separate_bed(orig_wav: Path, workdir: Path, log=print):
     log("separating vocals from music/SFX (Demucs htdemucs — first run "
         "downloads the model, ~300 MB) ...")
     out = workdir / "demucs"
-    proc = subprocess.run(
-        [sys.executable, "-m", "demucs", "--two-stems", "vocals",
-         "-n", "htdemucs", "-o", str(out), str(orig_wav)],
-        capture_output=True, text=True)
+    # Output goes to a file rather than a pipe: nobody drains a pipe while we
+    # sit in the poll loop, and a full pipe buffer deadlocks the child.
+    demucs_log = workdir / "demucs.log"
+    with open(demucs_log, "w", encoding="utf-8", errors="replace") as sink:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "demucs", "--two-stems", "vocals",
+             "-n", "htdemucs", "-o", str(out), str(orig_wav)],
+            stdout=sink, stderr=subprocess.STDOUT)
+        while proc.poll() is None:
+            if tick:
+                tick()
+            time.sleep(5)
     if proc.returncode != 0:
-        tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+        text = demucs_log.read_text(encoding="utf-8", errors="replace")
+        tail = "\n".join(text.strip().splitlines()[-6:])
         log(f"  Demucs failed, falling back to full-mix ducking:\n{tail}")
         return None
     bed_file = out / "htdemucs" / orig_wav.stem / "no_vocals.wav"
@@ -157,7 +173,7 @@ def normalize_dub(dub: np.ndarray) -> np.ndarray:
 
 def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
             bed_gain_db: float = 0.0, separate: bool = True,
-            keep_audio: str | None = None, log=print) -> dict:
+            keep_audio: str | None = None, log=print, tick=None) -> dict:
     """Lay `dub` over `video`'s music/effects bed and write `output`.
 
     Importable entry point — worker.py calls this after assembling a dub.
@@ -188,7 +204,7 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
     separated = False
     if has_audio:
         if separate:
-            bed = separate_bed(orig_wav, work, log=log)
+            bed = separate_bed(orig_wav, work, log=log, tick=tick)
             separated = bed is not None
         if bed is None:
             bed, _ = sf.read(orig_wav, dtype="float32", always_2d=True)

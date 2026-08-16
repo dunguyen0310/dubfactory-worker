@@ -173,6 +173,36 @@ def set_job(sb, job_id, **fields):
     sb.table("jobs").update(fields).eq("id", job_id).execute()
 
 
+def set_job_progress(sb, job_id, **fields):
+    """Progress writes must never kill a render.
+
+    The clips this update reports on are already uploaded; losing one counter
+    refresh to a network blip is nothing, losing the episode to it is hours.
+    """
+    try:
+        set_job(sb, job_id, **fields)
+    except Exception as e:
+        print(f"  (progress update failed: {e})", flush=True)
+
+
+def upload_output(sb, path, data: bytes, content_type: str):
+    """Upload to the outputs bucket, retrying once on a fresh token.
+
+    The final uploads run at the exact moment the access token is oldest —
+    after the whole episode has rendered — which is also the most expensive
+    possible moment to fail. One refresh-and-retry covers both an expired
+    token and a transient blip; a second failure is a real outage and raises.
+    """
+    try:
+        sb.storage.from_("outputs").upload(
+            path, data, {"content-type": content_type, "upsert": "true"})
+    except Exception as e:
+        print(f"  (upload {path} failed, retrying once: {e})", flush=True)
+        refresh_auth(sb, force=True)
+        sb.storage.from_("outputs").upload(
+            path, data, {"content-type": content_type, "upsert": "true"})
+
+
 def has_column(sb, table, column):
     """Columns from the voice-library migration are optional; degrade politely."""
     key = f"{table}.{column}"
@@ -251,6 +281,34 @@ def beat(sb, status, job_id=None, detail=None, force=False):
     except Exception as e:
         _beat["on"] = False
         print(f"  (engine status off — render_workers unavailable: {e})", flush=True)
+
+
+_touch = {"at": 0.0}
+
+
+def touch_job(sb, job, detail=None):
+    """Prove a job is alive during its long non-rendering stages.
+
+    The stall sweep requeues any job whose heartbeat is older than 15 minutes.
+    Rendering heartbeats every batch, but adaptation (minutes of LLM calls)
+    and muxing (Demucs on a full episode) used to go silent for their whole
+    duration — long enough to be mistaken for a dead worker and handed to a
+    second one, which would then render the same episode twice.
+
+    Cheap to call from any progress callback: rate-limited to one write per
+    30 s, renews the auth token on the way, and never raises — a failed
+    heartbeat must not kill the work it exists to protect.
+    """
+    if time.time() - _touch["at"] < 30:
+        return
+    _touch["at"] = time.time()
+    try:
+        refresh_auth(sb)
+        if has_column(sb, "jobs", "heartbeat_at"):
+            set_job(sb, job["id"], heartbeat_at=now_iso())
+        beat(sb, "busy", job_id=job["id"], detail=detail or job.get("title"))
+    except Exception as e:
+        print(f"  (heartbeat failed: {e})", flush=True)
 
 
 # -------------------------------------------------------------------- model
@@ -469,8 +527,13 @@ def adapt_cues(sb, job, cues, language, settings):
     pending = [c for c in cues if not (c.get("final_text") or "").strip()]
     if not pending:
         return
+    # Budget the SPOKEN text. source_text still carries the speaker label
+    # ("MINH: …"), which is stripped at render time — counting it here inflates
+    # every labeled line by its name's syllables, and sending it to the model
+    # asks it to rewrite a label nobody will speak.
     probes = [S.Cue(c["idx"], c["start_ms"] / 1000.0, c["end_ms"] / 1000.0,
-                    c["source_text"]) for c in pending]
+                    SPK.strip_label(c["source_text"], c.get("speaker")))
+              for c in pending]
     syl = float(settings.get("syllables_per_sec", S.SYLLABLES_PER_SEC))
     tol = float(settings.get("adapt_tolerance", A.DEFAULT_TOLERANCE))
     rows, targets = A.analyse(probes, syl, tol)
@@ -483,13 +546,18 @@ def adapt_cues(sb, job, cues, language, settings):
     log(sb, job, "adapting",
         f"{len(targets)} of {len(probes)} line(s) need shortening or "
         f"number-spelling ({over} over budget)")
+    def _adapt_log(m):
+        print(f"  [adapting] {m}", flush=True)
+        touch_job(sb, job, detail="adapting over-long lines")
+
     try:
         new_text = A.adapt(
             probes, targets, language=language,
             provider=settings.get("adapt_provider", "auto"),
             model=settings.get("adapt_model"),
             syllables_per_sec=syl,
-            log=lambda m: print(f"  [adapting] {m}", flush=True))
+            log=_adapt_log,
+            tick=lambda: touch_job(sb, job, detail="adapting over-long lines"))
     except (A.NoCredentials, A.BadModel) as e:
         # Never fail a render over this: the original text still speaks, it
         # just may overrun. Surface it so staff know why nothing was rewritten.
@@ -550,18 +618,23 @@ def mux_video(sb, job, work, dub_wav):
     local_video = work / ("source" + Path(video_path).suffix.lower())
     local_video.write_bytes(sb.storage.from_("videos").download(video_path))
 
+    def _mux_log(m):
+        print(f"  [muxing] {m}", flush=True)
+        touch_job(sb, job, detail="mixing the dubbed video")
+
     out_mp4 = work / "dubbed.mp4"
     info = V.mux_dub(
         str(local_video), str(dub_wav), str(out_mp4),
         duck_db=settings.get("duck_db"),
         separate=bool(settings.get("separate_voices", True)),
-        log=lambda m: print(f"  [muxing] {m}", flush=True),
+        log=_mux_log,
+        # Demucs on a full episode runs for many silent minutes; the tick is
+        # what keeps the stall sweep from handing the job to a second worker.
+        tick=lambda: touch_job(sb, job, detail="separating original voices"),
     )
 
     mp4_path = f"{owner}/{job_id}/dubbed.mp4"
-    sb.storage.from_("outputs").upload(
-        mp4_path, out_mp4.read_bytes(),
-        {"content-type": "video/mp4", "upsert": "true"})
+    upload_output(sb, mp4_path, out_mp4.read_bytes(), "video/mp4")
     if info["separated"]:
         note = "Music and effects kept, original voices removed"
     elif not settings.get("separate_voices", True):
@@ -789,11 +862,9 @@ def render_job(sb, job):
             local = work / f"cue_{c['idx']:05d}.wav"
             sf.write(local, wav, SR)
             try:
-                sb.storage.from_("outputs").upload(
-                    path, local.read_bytes(),
-                    {"content-type": "audio/wav", "upsert": "true"})
+                upload_output(sb, path, local.read_bytes(), "audio/wav")
             except Exception as e:
-                print(f"  cue {c['idx']} upload failed: {e}", flush=True)
+                print(f"  cue {c['idx']} upload failed twice: {e}", flush=True)
                 path = None
             done += 1
             sb.table("cues").update({
@@ -806,7 +877,7 @@ def render_job(sb, job):
         if time.time() - job_beat > 30 and has_column(sb, "jobs", "heartbeat_at"):
             fields["heartbeat_at"] = now_iso()
             job_beat = time.time()
-        set_job(sb, job_id, **fields)
+        set_job_progress(sb, job_id, **fields)
         beat(sb, "busy", job_id=job_id, detail=f"cue {done}/{len(cues)} — {job['title']}")
 
     # ------------------------------------------------------------ assemble
@@ -857,9 +928,7 @@ def render_job(sb, job):
     out_wav = work / "dub.wav"
     sf.write(out_wav, timeline, SR)
     wav_path = f"{owner}/{job_id}/dub.wav"
-    sb.storage.from_("outputs").upload(
-        wav_path, out_wav.read_bytes(),
-        {"content-type": "audio/wav", "upsert": "true"})
+    upload_output(sb, wav_path, out_wav.read_bytes(), "audio/wav")
 
     fields = {"status": "done", "wav_path": wav_path, "error": None,
               "done_cues": done, "review_cues": review}
@@ -872,9 +941,8 @@ def render_job(sb, job):
         for n, (c, a, b) in enumerate(final_times, 1):
             lines.append(f"{n}\n{S.fmt_ts(a)} --> {S.fmt_ts(b)}\n{cue_text(c)}\n")
         srt_path = f"{owner}/{job_id}/dub.srt"
-        sb.storage.from_("outputs").upload(
-            srt_path, ("\n".join(lines)).encode("utf-8"),
-            {"content-type": "application/x-subrip", "upsert": "true"})
+        upload_output(sb, srt_path, ("\n".join(lines)).encode("utf-8"),
+                      "application/x-subrip")
         fields["srt_out_path"] = srt_path
 
     cer_rows = sb.table("cues").select("cer").eq("job_id", job_id).execute().data
@@ -929,7 +997,14 @@ def render_job(sb, job):
                 f"Video mux failed, audio is still complete: {str(e)[:200]}")
 
     fields["qc_summary"] = qc
-    set_job(sb, job_id, **fields)
+    try:
+        set_job(sb, job_id, **fields)
+    except Exception:
+        # Everything is rendered and uploaded; failing to say so would strand
+        # a finished episode at 'rendering' until the stall sweep re-rendered
+        # it. One fresh-token retry before treating that as a real outage.
+        refresh_auth(sb, force=True)
+        set_job(sb, job_id, **fields)
     _stats["jobs"] += 1
     log(sb, job, "done",
         f"{end:.1f}s rendered, coverage {fields['qc_summary']['word_coverage']}%",
@@ -995,7 +1070,9 @@ def main():
     if args.requeue_stalled:
         try:
             n = sb.rpc("requeue_stalled_jobs", {"stale_minutes": 15}).execute().data
-            print(f"requeued {n} stalled job(s)", flush=True)
+            # The sweep also returns voices rescued from a dead 'encoding'
+            # claim, so the count is items, not just jobs.
+            print(f"requeued {n} stalled item(s)", flush=True)
         except Exception as e:
             print(f"(requeue_stalled_jobs unavailable: {e})", flush=True)
 

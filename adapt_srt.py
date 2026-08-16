@@ -322,11 +322,15 @@ def rewrite_batch(client, language, batch, firm=False):
 
 
 def adapt(cues, targets, *, language, provider="auto", model=None,
-          syllables_per_sec, log=print):
+          syllables_per_sec, log=print, tick=None):
     """Rewrite the targeted cues to fit their syllable budgets.
 
     Importable entry point — worker.py calls this as a pre-render step.
     Returns {cue index: new text}, containing only lines that actually changed.
+
+    `tick`, if given, is called after every API batch. A long episode is many
+    batches of slow LLM calls, and the worker uses the tick to heartbeat so
+    the stall sweep does not mistake minutes of adaptation for a dead worker.
     """
     client = make_client(provider, model)
     by_index = {c.index: c for c in cues}
@@ -348,6 +352,8 @@ def adapt(cues, targets, *, language, provider="auto", model=None,
                 chunk.append((probe, syllable_budget(c, syllables_per_sec),
                               S.syllables(cur)))
             out = rewrite_batch(client, language, chunk, firm=attempt > 1)
+            if tick:
+                tick()
             for probe, budget, _ in chunk:
                 idx = probe.index
                 candidate = out.get(idx)
