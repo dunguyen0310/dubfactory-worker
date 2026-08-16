@@ -122,19 +122,36 @@ def get_client():
     return sb
 
 
-def refresh_auth(sb):
-    """Re-sign-in before the JWT expires. A dub run lasts hours; the default
-    access token does not."""
+# Supabase access tokens last an hour. Refreshing at half that leaves room for
+# one failed attempt and a slow retry before anything actually expires.
+TOKEN_MAX_AGE = 30 * 60
+
+
+def refresh_auth(sb, force: bool = False):
+    """Re-sign-in before the JWT expires.
+
+    Must be called from inside a render, not only between jobs. A 400-cue
+    episode takes about an hour, which is exactly the token's lifetime — one
+    was lost after all 411 cues had rendered, three minutes into uploading the
+    result, to `"exp" claim timestamp check failed`. Every second of that GPU
+    time was already spent.
+
+    Cheap to call often: it returns immediately unless the token is old.
+    """
     if not _auth["email"]:
-        return
-    if time.time() - _auth["at"] < 40 * 60:
+        return                      # service_role key — never expires
+    age = time.time() - _auth["at"]
+    if not force and age < TOKEN_MAX_AGE:
         return
     try:
         sb.auth.sign_in_with_password({"email": _auth["email"],
                                        "password": _auth["password"]})
         _auth["at"] = time.time()
+        print(f"  (auth token refreshed after {age / 60:.0f} min)", flush=True)
     except Exception as e:
-        print(f"  (token refresh failed: {e})", flush=True)
+        # Leave _auth["at"] alone so the next call tries again rather than
+        # waiting another full interval on a token that is already stale.
+        print(f"  (token refresh failed, will retry: {e})", flush=True)
 
 
 def now_iso():
@@ -682,6 +699,11 @@ def render_job(sb, job):
 
     failed_batches = 0
     for voice_id, batch in batches:
+        # Renew the token before the batch, not after: this batch is about to
+        # upload a dozen clips, and an episode outlives its access token.
+        # Rate-limited internally, so calling it every batch costs nothing.
+        refresh_auth(sb)
+
         _, prompt, ref_timbre = voices[voice_id]
         best = {c["id"]: None for c in batch}
         pending = list(batch)
@@ -788,6 +810,10 @@ def render_job(sb, job):
         beat(sb, "busy", job_id=job_id, detail=f"cue {done}/{len(cues)} — {job['title']}")
 
     # ------------------------------------------------------------ assemble
+    # Everything from here is uploads — the dub, the .srt, maybe a video — and
+    # it is the most expensive possible moment to be told the token expired,
+    # because the whole episode is already rendered. Start it on a fresh one.
+    refresh_auth(sb, force=True)
     set_job(sb, job_id, status="qc")
     log(sb, job, "qc", f"{done - review}/{done} cues passed verification")
     set_job(sb, job_id, status="assembling")
