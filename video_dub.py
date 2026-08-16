@@ -7,12 +7,28 @@ original speech is gone. This tool does that:
     1. extract the original audio from the video (ffmpeg)
     2. split it into vocals vs music+SFX with Demucs, keep the music+SFX bed
        (no Demucs installed? fall back to using the full original mix)
-    3. duck the bed under the dub (gain dips while the dub speaks,
+    3. blend a little of the vocals stem back into the bed, quiet enough to
+       read as room tone rather than as speech (see BLEND below)
+    4. duck the bed under the dub (gain dips while the dub speaks,
        recovers in the gaps — sidechain-style, computed sample-accurately)
-    4. mix, peak-normalize, and mux back into the video; the video stream is
+    5. mix, peak-normalize, and mux back into the video; the video stream is
        copied untouched, so this is fast and lossless for the picture
 
     python video_dub.py --video ad.mp4 --dub dub.wav --output ad_vn.mp4
+
+BLEND. Demucs is a *music* separation model, and its "vocals" stem is
+everything voice-like — not just the dialogue. On a scene whose soundscape is
+people (a crowd, an interview, a street sketch) the no_vocals bed comes back
+nearly empty, because the murmur, the laughter and the shouting all left with
+the lines. The dub then plays over silence, which sounds worse than not
+separating at all and is the one failure mode with no obvious cause in the log.
+
+So a copy of the vocals stem goes back into the bed at RESIDUAL_DB (-20 dB by
+default). That is far too quiet to follow as speech — the duck takes another
+10 dB off it while the dub speaks — but it is enough to restore the ambience
+that came out with the voices. It is how an M&E track gets faked when
+production never delivered one. `--no-residual` keeps the bed pure, which is
+the right choice for material that separates cleanly, like a music video.
 
 Demucs is optional but recommended: without it the original voices are still
 underneath, just pushed down hard. Install (Linux/Colab, or Windows with a
@@ -45,6 +61,15 @@ SPEECH_RMS_DBFS = -45.0    # dub RMS above this counts as "speaking"
 DUB_TARGET_DBFS = -20.0    # active-speech level the dub is normalized to
 MAX_DUB_BOOST_DB = 12.0
 
+# How much of the separated vocals stem is mixed back into the bed. Low enough
+# to read as room tone, high enough to bring a crowd back. See BLEND above.
+RESIDUAL_DB = -20.0
+
+# A separated bed quieter than this had nothing in it to keep. Worth saying so
+# in the log: it is the difference between "the music here is subtle" and
+# "there was never any music and the blend is carrying the whole background".
+SILENT_BED_DBFS = -50.0
+
 
 def die(msg: str):
     sys.exit(f"error: {msg}")
@@ -76,7 +101,11 @@ def extract_audio(video: str, out_wav: Path) -> bool:
 
 
 def separate_bed(orig_wav: Path, workdir: Path, log=print, tick=None):
-    """Demucs two-stem split; returns the music+SFX bed, or None if unavailable.
+    """Demucs two-stem split; returns ``(bed, vocals)``, or None if unavailable.
+
+    ``bed`` is the music+SFX stem and ``vocals`` everything voice-like, which on
+    dialogue-heavy material is most of the recording — hence the blend back in
+    :func:`mux_dub`. ``vocals`` is None only if Demucs wrote the one stem.
 
     Runs the demucs CLI in a subprocess rather than importing an API: the CLI
     is stable across every released version, the api module is not.
@@ -111,14 +140,14 @@ def separate_bed(orig_wav: Path, workdir: Path, log=print, tick=None):
         tail = "\n".join(text.strip().splitlines()[-6:])
         log(f"  Demucs failed, falling back to full-mix ducking:\n{tail}")
         return None
-    bed_file = out / "htdemucs" / orig_wav.stem / "no_vocals.wav"
+    stem_dir = out / "htdemucs" / orig_wav.stem
+    bed_file = stem_dir / "no_vocals.wav"
     if not bed_file.exists():
         log("  Demucs produced no no_vocals stem — falling back")
         return None
-    bed, sr = sf.read(bed_file, dtype="float32", always_2d=True)
-    if sr != MASTER_SR:
-        bed = resample(bed, sr, MASTER_SR)
-    return bed
+    voc_file = stem_dir / "vocals.wav"
+    return (_read_at_master(bed_file),
+            _read_at_master(voc_file) if voc_file.exists() else None)
 
 
 def resample(x: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
@@ -130,6 +159,20 @@ def resample(x: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
     return np.stack([librosa.resample(np.ascontiguousarray(x[:, c]),
                                       orig_sr=sr_from, target_sr=sr_to)
                      for c in range(x.shape[1])], axis=1)
+
+
+def _read_at_master(path: Path) -> np.ndarray:
+    """Read a wav as 2-D float32 at MASTER_SR."""
+    x, sr = sf.read(path, dtype="float32", always_2d=True)
+    return resample(x, sr, MASTER_SR) if sr != MASTER_SR else x
+
+
+def dbfs(x: np.ndarray) -> float:
+    """RMS level of `x` in dBFS, floored at -99 so it logs and stores cleanly."""
+    if not x.size:
+        return -99.0
+    rms = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
+    return max(-99.0, 20.0 * float(np.log10(max(rms, 1e-12))))
 
 
 def speech_gain_curve(dub: np.ndarray, duck_gain: float) -> np.ndarray:
@@ -173,8 +216,13 @@ def normalize_dub(dub: np.ndarray) -> np.ndarray:
 
 def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
             bed_gain_db: float = 0.0, separate: bool = True,
+            residual_db: float | None = RESIDUAL_DB,
             keep_audio: str | None = None, log=print, tick=None) -> dict:
     """Lay `dub` over `video`'s music/effects bed and write `output`.
+
+    `residual_db` is how much of the separated vocals stem goes back into the
+    bed to restore ambience; None keeps the bed pure. It does nothing without a
+    separation, because the unseparated bed is the full mix already.
 
     Importable entry point — worker.py calls this after assembling a dub.
     Returns a summary dict suitable for storing as job QC evidence.
@@ -200,18 +248,46 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
     voice = normalize_dub(voice)
 
     # ---- bed -------------------------------------------------------------
-    bed = None
+    bed = residual = None
     separated = False
     if has_audio:
         if separate:
-            bed = separate_bed(orig_wav, work, log=log, tick=tick)
-            separated = bed is not None
+            stems = separate_bed(orig_wav, work, log=log, tick=tick)
+            if stems is not None:
+                bed, residual = stems
+                separated = True
         if bed is None:
             bed, _ = sf.read(orig_wav, dtype="float32", always_2d=True)
             log("using the full original mix as the bed "
                 "(original speech remains, ducked)")
         else:
             log("bed = music + effects only (original speech removed)")
+
+    # ---- blend the ambience back ----------------------------------------
+    # Only after a separation: an unseparated bed is the full mix and already
+    # has its ambience, plus the dialogue we would be doubling.
+    bed_dbfs = dbfs(bed) if bed is not None else None
+    silent_bed = bool(separated and bed_dbfs is not None
+                      and bed_dbfs <= SILENT_BED_DBFS)
+    applied_residual = None
+    if separated:
+        if silent_bed:
+            log(f"NOTE: the separated bed is nearly silent ({bed_dbfs:.0f} "
+                f"dBFS) — this source has no music or effects that survive "
+                f"without the voices.")
+        if residual is None:
+            log("  no vocals stem to blend from — using the separated bed as is")
+        elif residual_db is None:
+            log("  ambience blend off — bed is the separated stem only")
+        else:
+            n_r = min(bed.shape[0], residual.shape[0])
+            bed[:n_r] += residual[:n_r] * 10 ** (residual_db / 20)
+            applied_residual = float(residual_db)
+            log(f"blending ambience back at {residual_db:.0f} dB "
+                f"(bed {bed_dbfs:.0f} -> {dbfs(bed):.0f} dBFS)")
+        if silent_bed and applied_residual is None:
+            log("  the dub will play over near-silence — pass --residual-db "
+                "to keep the ambience, or --no-separate to keep the whole mix")
 
     if duck_db is None:
         duck_db = 10.0 if separated else 18.0
@@ -262,6 +338,10 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
 
     return {
         "separated": separated,
+        "residual_db": (None if applied_residual is None
+                        else round(applied_residual, 1)),
+        "bed_dbfs": None if bed_dbfs is None else round(bed_dbfs, 1),
+        "silent_bed": silent_bed,
         "duck_db": round(float(duck_db), 1),
         "dub_seconds": round(dub_len, 2),
         "video_seconds": round(bed_len, 2),
@@ -283,13 +363,21 @@ def main():
                    help="overall bed level adjustment")
     p.add_argument("--no-separate", action="store_true",
                    help="skip Demucs even if installed (duck the full mix)")
+    p.add_argument("--residual-db", type=float, default=RESIDUAL_DB,
+                   help="how much of the separated vocals stem is blended back "
+                        "into the bed, restoring crowd and room tone "
+                        f"(default {RESIDUAL_DB:.0f})")
+    p.add_argument("--no-residual", action="store_true",
+                   help="keep the separated bed pure — blend nothing back")
     p.add_argument("--keep-audio", help="also save the mixed track as this .wav")
     args = p.parse_args()
 
     try:
         mux_dub(args.video, args.dub, args.output,
                 duck_db=args.duck_db, bed_gain_db=args.bed_gain_db,
-                separate=not args.no_separate, keep_audio=args.keep_audio)
+                separate=not args.no_separate,
+                residual_db=None if args.no_residual else args.residual_db,
+                keep_audio=args.keep_audio)
     except FileNotFoundError as e:
         die(str(e))
     print(f"\nwrote {args.output}")
