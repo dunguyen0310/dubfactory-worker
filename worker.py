@@ -626,6 +626,9 @@ def mux_video(sb, job, work, dub_wav):
     info = V.mux_dub(
         str(local_video), str(dub_wav), str(out_mp4),
         duck_db=settings.get("duck_db"),
+        # An absent key means the default blend; an explicit null means the job
+        # asked for a pure separated bed, so .get's default cannot be reused.
+        residual_db=settings.get("residual_db", V.RESIDUAL_DB),
         separate=bool(settings.get("separate_voices", True)),
         log=_mux_log,
         # Demucs on a full episode runs for many silent minutes; the tick is
@@ -635,13 +638,26 @@ def mux_video(sb, job, work, dub_wav):
 
     mp4_path = f"{owner}/{job_id}/dubbed.mp4"
     upload_output(sb, mp4_path, out_mp4.read_bytes(), "video/mp4")
-    if info["separated"]:
-        note = "Music and effects kept, original voices removed"
-    elif not settings.get("separate_voices", True):
-        note = "Original mix ducked under the dub (separation turned off for this job)"
-    else:
-        note = ("Original mix ducked under the dub — install Demucs on the "
+    blend = info.get("residual_db")
+    if not info["separated"]:
+        note = ("Original mix ducked under the dub (separation turned off for this job)"
+                if not settings.get("separate_voices", True) else
+                "Original mix ducked under the dub — install Demucs on the "
                 "worker to remove the original voices")
+    elif info.get("silent_bed") and blend is None:
+        # The one outcome that sounds broken rather than merely imperfect, so
+        # it is named on the job instead of left to be discovered on playback.
+        note = ("This source has no music or effects that survive separation, "
+                "and the ambience blend is off — the dub plays over near-"
+                "silence. Set an ambience blend, or keep the original mix.")
+    elif info.get("silent_bed"):
+        note = ("Original voices removed. This source had no separable music, "
+                f"so the background is entirely the ambience blend at {blend:.0f} dB")
+    elif blend is not None:
+        note = ("Music and effects kept, original voices removed, ambience "
+                f"blended back at {blend:.0f} dB")
+    else:
+        note = "Music and effects kept, original voices removed"
     log(sb, job, "muxing", note, info)
     return mp4_path, info
 
@@ -1029,6 +1045,12 @@ def claim_next_job(sb):
     if has_column(sb, "jobs", "claimed_at"):
         fields["claimed_at"] = now_iso()
         fields["heartbeat_at"] = now_iso()
+    # render_workers only knows what a worker is on *now*, so the record of
+    # which GPU rendered a job disappears the moment it finishes. Stamped here
+    # instead, the queue board can still say "rendered on RunPod" a week later.
+    if has_column(sb, "jobs", "worker_label"):
+        fields["worker_label"] = worker_label()
+        fields["worker_gpu"] = gpu_name()
     got = (sb.table("jobs").update(fields)
            .eq("id", job["id"]).eq("status", "queued").execute().data)
     return job if got else None
