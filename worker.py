@@ -252,6 +252,15 @@ def get_model():
     return _model
 
 
+# Whisper's feature extractor cannot build a spectrogram from silence shorter
+# than one frame; handed a zero-length array it raises
+#   cannot reshape tensor of 0 elements into shape [-1, 0]
+# which used to escape render_job and fail the whole episode. Generation does
+# occasionally return no samples — a cue whose text has nothing pronounceable in
+# it ("...") reproduces it every time — so this has to be handled, not avoided.
+MIN_ASR_SAMPLES = SR // 20        # 50 ms; below this there is nothing to hear
+
+
 def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
     """Transcribe a list of clips, batched through the underlying HF pipeline.
 
@@ -259,23 +268,45 @@ def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
     a list, which keeps the GPU busy instead of paying per-call overhead on
     every short cue. Falls back to one-at-a-time if anything about the batched
     path fails, since verification must never be the thing that breaks a job.
+
+    Clips too short to transcribe come back as "" rather than raising. That is
+    the honest answer — nothing was said — and it flows through coverage() as
+    0% spoken, so the cue is retried like any other bad take instead of taking
+    the episode down with it.
     """
     if not clips:
         return []
+
+    sayable = [i for i, c in enumerate(clips) if c.size >= MIN_ASR_SAMPLES]
+    texts = [""] * len(clips)
+    if len(sayable) != len(clips):
+        print(f"  ({len(clips) - len(sayable)} clip(s) too short to transcribe "
+              f"— counted as nothing spoken)", flush=True)
+    if not sayable:
+        return texts
+
+    batch = [clips[i].astype(np.float32) for i in sayable]
     try:
-        inputs = [{"array": c.astype(np.float32), "sampling_rate": SR} for c in clips]
+        inputs = [{"array": c, "sampling_rate": SR} for c in batch]
         out = model._asr_pipe(inputs, batch_size=max(1, ASR_BATCH))
         if isinstance(out, dict):
             out = [out]
-        return [str(o["text"]).strip() for o in out]
+        for i, o in zip(sayable, out):
+            texts[i] = str(o["text"]).strip()
+        return texts
     except Exception as e:
         print(f"  (batched ASR unavailable, falling back: {e})", flush=True)
-        import torch
-        texts = []
-        for c in clips:
-            t = model.transcribe((torch.from_numpy(c), SR))
-            texts.append(str(t[0] if isinstance(t, (list, tuple)) else t).strip())
-        return texts
+
+    import torch
+    for i in sayable:
+        # One clip failing to transcribe must not lose the verification for the
+        # rest of the batch — an empty transcript just means "retry this cue".
+        try:
+            t = model.transcribe((torch.from_numpy(clips[i]), SR))
+            texts[i] = str(t[0] if isinstance(t, (list, tuple)) else t).strip()
+        except Exception as e:
+            print(f"  (clip {i} could not be transcribed: {e})", flush=True)
+    return texts
 
 
 # ------------------------------------------------------------ voice library
@@ -649,6 +680,7 @@ def render_job(sb, job):
         raise RuntimeError(
             f"batching lost cues: planned {planned} of {len(todo)}")
 
+    failed_batches = 0
     for voice_id, batch in batches:
         _, prompt, ref_timbre = voices[voice_id]
         best = {c["id"]: None for c in batch}
@@ -661,12 +693,24 @@ def render_job(sb, job):
                     S.natural_estimate(cue_text(c)) * (1 + 0.1 * (attempt - 1)) / S.OVERSHOOT
                     for c in pending
                 ]
-            outs = model.generate(
-                text=[cue_text(c) for c in pending],
-                voice_clone_prompt=[prompt] * len(pending), **kw,
-            )
-            wavs = [np.asarray(a, dtype=np.float32).squeeze() for a in outs]
-            heard = transcribe_many(model, wavs)
+            # An episode is hours of GPU time. Losing all of it because one
+            # batch raised is the expensive failure, so a batch that breaks is
+            # abandoned and its cues flagged, while everything already rendered
+            # is kept and the job goes on to finish.
+            try:
+                outs = model.generate(
+                    text=[cue_text(c) for c in pending],
+                    voice_clone_prompt=[prompt] * len(pending), **kw,
+                )
+                wavs = [np.asarray(a, dtype=np.float32).squeeze() for a in outs]
+                heard = transcribe_many(model, wavs)
+            except Exception as e:
+                failed_batches += 1
+                traceback.print_exc()
+                log(sb, job, "rendering",
+                    f"Cue(s) {[c['idx'] for c in pending]} could not be "
+                    f"rendered and were skipped: {str(e)[:160]}")
+                break
 
             still = []
             for c, wav, txt in zip(pending, wavs, heard):
@@ -682,7 +726,32 @@ def render_job(sb, job):
                 break
 
         for c in batch:
-            wav, cov, sim, missing, tonal = best[c["id"]]
+            take = best[c["id"]]
+            # No take at all — the batch broke before producing one. Flag the
+            # cue so it shows up for re-roll and carry on with the episode.
+            if take is None:
+                review += 1
+                done += 1
+                sb.table("cues").update({
+                    "status": "qc_fail", "cer": 1.0, "audio_path": None,
+                    "rendered_ms": 0, "final_text": cue_text(c),
+                    "note": "render failed — re-roll this line",
+                }).eq("id", c["id"]).execute()
+                continue
+
+            wav, cov, sim, missing, tonal = take
+            # A zero-length take is silence, not audio: keeping it would write an
+            # empty clip and place a 0s hole in the timeline.
+            if wav.size == 0:
+                review += 1
+                done += 1
+                sb.table("cues").update({
+                    "status": "qc_fail", "cer": 1.0, "audio_path": None,
+                    "rendered_ms": 0, "final_text": cue_text(c),
+                    "note": "model produced no audio — re-roll, or reword this line",
+                }).eq("id", c["id"]).execute()
+                continue
+
             clips[c["idx"]] = wav
             _stats["cues"] += 1
             _stats["audio_s"] += wav.size / SR
@@ -726,7 +795,7 @@ def render_job(sb, job):
     placed, cursor = [], 0.0
     for c in sorted(speak, key=lambda x: x["idx"]):
         clip = clips.get(c["idx"])
-        if clip is None:
+        if clip is None or clip.size == 0:
             continue
         # A subtitle cue starts at its timestamp, or later if the previous clip
         # is still running. A read-aloud has no timestamps worth honouring —
@@ -792,6 +861,13 @@ def render_job(sb, job):
         "audio_seconds": round(end, 2),
         "voice": vrow["name"], "kind": kind,
     }
+    if failed_batches:
+        # The episode finished, but not all of it rendered. Say so on the job
+        # rather than letting a quietly shorter dub look like a clean run.
+        qc["failed_batches"] = failed_batches
+        log(sb, job, "qc",
+            f"{failed_batches} batch(es) failed to render; those cues are "
+            f"flagged for re-roll and are silent in the mix")
     # Only a job with a real timecode can overrun it. For a read-aloud the
     # "srt seconds" would just be this pipeline's own estimate, and reporting
     # the audio as running over its own guess is noise, not information.
