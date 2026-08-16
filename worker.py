@@ -644,20 +644,17 @@ def mux_video(sb, job, work, dub_wav):
                 if not settings.get("separate_voices", True) else
                 "Original mix ducked under the dub — install Demucs on the "
                 "worker to remove the original voices")
-    elif info.get("silent_bed") and blend is None:
+    elif not info.get("silent_bed"):
+        note = "Music and effects kept, original voices removed"
+    elif blend is None:
         # The one outcome that sounds broken rather than merely imperfect, so
         # it is named on the job instead of left to be discovered on playback.
         note = ("This source has no music or effects that survive separation, "
                 "and the ambience blend is off — the dub plays over near-"
                 "silence. Set an ambience blend, or keep the original mix.")
-    elif info.get("silent_bed"):
-        note = ("Original voices removed. This source had no separable music, "
-                f"so the background is entirely the ambience blend at {blend:.0f} dB")
-    elif blend is not None:
-        note = ("Music and effects kept, original voices removed, ambience "
-                f"blended back at {blend:.0f} dB")
     else:
-        note = "Music and effects kept, original voices removed"
+        note = ("Original voices removed. This source had no separable music, "
+                f"so the background is the ambience blend at {blend:.0f} dB")
     log(sb, job, "muxing", note, info)
     return mp4_path, info
 

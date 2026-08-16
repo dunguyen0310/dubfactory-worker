@@ -7,8 +7,8 @@ original speech is gone. This tool does that:
     1. extract the original audio from the video (ffmpeg)
     2. split it into vocals vs music+SFX with Demucs, keep the music+SFX bed
        (no Demucs installed? fall back to using the full original mix)
-    3. blend a little of the vocals stem back into the bed, quiet enough to
-       read as room tone rather than as speech (see BLEND below)
+    3. if that bed came back too thin to carry the background, blend a little
+       of the vocals stem back into it (see BLEND below)
     4. duck the bed under the dub (gain dips while the dub speaks,
        recovers in the gaps — sidechain-style, computed sample-accurately)
     5. mix, peak-normalize, and mux back into the video; the video stream is
@@ -27,8 +27,15 @@ So a copy of the vocals stem goes back into the bed at RESIDUAL_DB (-20 dB by
 default). That is far too quiet to follow as speech — the duck takes another
 10 dB off it while the dub speaks — but it is enough to restore the ambience
 that came out with the voices. It is how an M&E track gets faked when
-production never delivered one. `--no-residual` keeps the bed pure, which is
-the right choice for material that separates cleanly, like a music video.
+production never delivered one.
+
+The blend is a rescue, so it is CONDITIONAL: it runs only when the bed is too
+thin to stand on its own (SILENT_BED_DBFS / BED_DEFICIT_DB). A film with a real
+music track separates cleanly, needs no rescue, and gets none — blending there
+would put the original dialogue back for nothing. Measured on one such film:
+blending unconditionally left the original speech 19 dB down, where leaving the
+bed alone left it 30 dB down, the floor of what separation can remove.
+`--no-residual` declines the rescue even when it is warranted.
 
 Demucs is optional but recommended: without it the original voices are still
 underneath, just pushed down hard. Install (Linux/Colab, or Windows with a
@@ -65,10 +72,12 @@ MAX_DUB_BOOST_DB = 12.0
 # to read as room tone, high enough to bring a crowd back. See BLEND above.
 RESIDUAL_DB = -20.0
 
-# A separated bed quieter than this had nothing in it to keep. Worth saying so
-# in the log: it is the difference between "the music here is subtle" and
-# "there was never any music and the blend is carrying the whole background".
+# When the separated bed counts as too thin to carry the background on its own,
+# which is the only case the blend exists for. Either it is near digital silence
+# outright, or it sits this far under the original mix — meaning separation took
+# nearly everything, so what it took was the background as well as the voices.
 SILENT_BED_DBFS = -50.0
+BED_DEFICIT_DB = 20.0
 
 
 def die(msg: str):
@@ -264,30 +273,38 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
             log("bed = music + effects only (original speech removed)")
 
     # ---- blend the ambience back ----------------------------------------
-    # Only after a separation: an unseparated bed is the full mix and already
-    # has its ambience, plus the dialogue we would be doubling.
+    # The blend is a RESCUE, not a garnish, so it is conditional. Where the
+    # separation left a real music/effects bed there is nothing to rescue, and
+    # blending would only put the original dialogue back for no gain. It runs
+    # only when the bed came back too thin to carry the background at all.
     bed_dbfs = dbfs(bed) if bed is not None else None
+    orig_dbfs = dbfs(_read_at_master(orig_wav)) if has_audio else None
+
+    # Two ways to be dead, because an absolute floor alone misjudges a quiet
+    # source: a bed at -48 dBFS is healthy under a -45 dBFS mix and hopeless
+    # under a -12 dBFS one. The deficit catches that; the floor catches digital
+    # silence, where the deficit would divide a near-zero by a near-zero.
+    deficit = (orig_dbfs - bed_dbfs) if (separated and orig_dbfs is not None) else 0.0
     silent_bed = bool(separated and bed_dbfs is not None
-                      and bed_dbfs <= SILENT_BED_DBFS)
+                      and (bed_dbfs <= SILENT_BED_DBFS
+                           or deficit >= BED_DEFICIT_DB))
     applied_residual = None
     if separated:
-        if silent_bed:
-            log(f"NOTE: the separated bed is nearly silent ({bed_dbfs:.0f} "
-                f"dBFS) — this source has no music or effects that survive "
-                f"without the voices.")
-        if residual is None:
-            log("  no vocals stem to blend from — using the separated bed as is")
+        log(f"bed {bed_dbfs:.0f} dBFS, {deficit:.0f} dB below the original mix")
+        if not silent_bed:
+            log("  bed is intact — no ambience blend needed")
+        elif residual is None:
+            log("  bed is thin, but there is no vocals stem to blend from")
         elif residual_db is None:
-            log("  ambience blend off — bed is the separated stem only")
+            log("  bed is thin and the blend is off — the dub will play over "
+                "near-silence; drop --no-residual, or --no-separate to keep "
+                "the whole mix")
         else:
             n_r = min(bed.shape[0], residual.shape[0])
             bed[:n_r] += residual[:n_r] * 10 ** (residual_db / 20)
             applied_residual = float(residual_db)
-            log(f"blending ambience back at {residual_db:.0f} dB "
-                f"(bed {bed_dbfs:.0f} -> {dbfs(bed):.0f} dBFS)")
-        if silent_bed and applied_residual is None:
-            log("  the dub will play over near-silence — pass --residual-db "
-                "to keep the ambience, or --no-separate to keep the whole mix")
+            log(f"  bed is thin — blending ambience back at {residual_db:.0f} "
+                f"dB (bed {bed_dbfs:.0f} -> {dbfs(bed):.0f} dBFS)")
 
     if duck_db is None:
         duck_db = 10.0 if separated else 18.0
@@ -341,6 +358,7 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
         "residual_db": (None if applied_residual is None
                         else round(applied_residual, 1)),
         "bed_dbfs": None if bed_dbfs is None else round(bed_dbfs, 1),
+        "bed_deficit_db": round(float(deficit), 1) if separated else None,
         "silent_bed": silent_bed,
         "duck_db": round(float(duck_db), 1),
         "dub_seconds": round(dub_len, 2),
