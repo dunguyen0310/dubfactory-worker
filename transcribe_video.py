@@ -154,7 +154,7 @@ def load_asr(whisperx, *, model_name, device, index, compute, language,
     use the other and say so, not to fail a job that has a working ASR model.
     """
     order = [vad_method] + [m for m in ("silero", "pyannote") if m != vad_method]
-    last = None
+    failures = []
     for method in order:
         try:
             model = whisperx.load_model(
@@ -164,11 +164,39 @@ def load_asr(whisperx, *, model_name, device, index, compute, language,
                 log(f"{vad_method} VAD could not be built — using {method} instead")
             return model
         except Exception as e:
-            last = e
-            log(f"{method} VAD unavailable: {str(e).strip().splitlines()[-1][:150]}")
+            failures.append((method, e))
+            log(f"{method} VAD unavailable: {_why(e)}")
+    # Every failure, with its underlying cause, not just the last one's summary.
+    #
+    # Both attempts reporting the same error is itself the diagnosis — it means
+    # the failure is in importing whisperx.asr rather than in either detector —
+    # and the first version of this message hid that by printing one line of the
+    # last exception. Worse, the errors that land here are usually wrappers:
+    # transformers re-raises a broken submodule import as "Could not import
+    # module 'Pipeline'. Are this object's requirements defined correctly?",
+    # which names nothing that is actually wrong. The chained cause is the only
+    # part worth reading, so it goes in the message that reaches the job row.
+    detail = "; ".join(f"{m}: {_why(e)}" for m, e in failures)
     raise RuntimeError(
-        "Neither VAD could be loaded, so the audio cannot be split into speech "
-        f"regions. Last error: {last}") from last
+        f"No VAD could be loaded, so the audio cannot be split into speech "
+        f"regions. {detail}") from (failures[0][1] if failures else None)
+
+
+def _why(exc: BaseException) -> str:
+    """An exception summarised through its cause chain.
+
+    A bare str() on a wrapped import error describes the wrapper. Following
+    __cause__ is what turns "Could not import module 'Pipeline'" into the
+    missing symbol or version clash that actually broke.
+    """
+    parts, seen = [], set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        text = str(cur).strip().splitlines()
+        parts.append(f"{type(cur).__name__}: {text[-1][:200] if text else '(no message)'}")
+        cur = cur.__cause__ or cur.__context__
+    return " <- caused by ".join(parts[:4])
 
 
 def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
