@@ -767,6 +767,7 @@ def transcribe_job(sb, job):
             batch_size=int(os.environ.get("WORKER_WHISPER_BATCH", "8")),
             source_language=source,
             align=bool(settings.get("align_words", True)),
+            vad_method=settings.get("vad_method", T.VAD_METHOD),
             log=_asr_log,
             tick=lambda pct: touch_job(
                 sb, job, detail=f"transcribing — {pct:.0f}%"),
