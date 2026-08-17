@@ -66,6 +66,25 @@ NO_SPACE_LANGS = {"ja", "zh", "yue", "th", "lo", "my", "km"}
 DEFAULT_MODEL = "large-v3"
 BATCH = 25              # cues per translation call, same as adapt_srt
 
+# Which voice-activity detector splits the audio before transcription.
+#
+# Silero by default, and not for quality reasons: WhisperX's own pyannote path is
+# broken by its own dependency pin. The VAD checkpoint it ships
+# (whisperx/assets/pytorch_model.bin) is a April-2022 pyannote 2.x segmentation
+# model — class pyannote.audio.models.segmentation.PyanNet, saved with
+# torch 1.10 and pytorch-lightning 1.5.4 — while whisperx 3.8.6 requires
+# pyannote-audio>=4.0.0, which no longer has the classes that checkpoint pickles.
+# Loading it therefore fails with pyannote's
+#     Could not import module 'Pipeline'. Are this object's requirements
+#     defined correctly?
+# which reads like a problem with this code and is not one.
+#
+# Silero loads through torch.hub instead, so it touches no pyannote at all and
+# needs no Hugging Face token. `load_asr` tries the other one if the chosen one
+# cannot be built, so a future whisperx that fixes pyannote is picked up by
+# setting settings.vad_method rather than by editing this.
+VAD_METHOD = "silero"
+
 
 # ------------------------------------------------------------------- device
 
@@ -125,10 +144,37 @@ def free_gpu():
 
 # ---------------------------------------------------------------- transcribe
 
+def load_asr(whisperx, *, model_name, device, index, compute, language,
+             vad_method=VAD_METHOD, log=print):
+    """Build the ASR pipeline, trying the other VAD if the chosen one will not load.
+
+    The VAD is constructed inside load_model, so a broken one fails the whole
+    call rather than degrading. Both detectors do the same job here — cut the
+    audio into speech regions — so when one cannot be built the honest move is to
+    use the other and say so, not to fail a job that has a working ASR model.
+    """
+    order = [vad_method] + [m for m in ("silero", "pyannote") if m != vad_method]
+    last = None
+    for method in order:
+        try:
+            model = whisperx.load_model(
+                model_name, device, device_index=index, compute_type=compute,
+                language=language, vad_method=method)
+            if method != vad_method:
+                log(f"{vad_method} VAD could not be built — using {method} instead")
+            return model
+        except Exception as e:
+            last = e
+            log(f"{method} VAD unavailable: {str(e).strip().splitlines()[-1][:150]}")
+    raise RuntimeError(
+        "Neither VAD could be loaded, so the audio cannot be split into speech "
+        f"regions. Last error: {last}") from last
+
+
 def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
                compute_type: str | None = None, batch_size: int = 8,
                source_language: str | None = None, align: bool = True,
-               log=print, tick=None) -> dict:
+               vad_method: str = VAD_METHOD, log=print, tick=None) -> dict:
     """Run ASR and word alignment over a media file.
 
     Returns {"language", "segments", "alignment"} where each segment is
@@ -154,12 +200,12 @@ def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
         log("no CUDA device — transcribing on the CPU, which is many times "
             "slower than realtime")
 
-    log(f"loading {model_name} on {dev}:{index} ({compute})")
+    log(f"loading {model_name} on {dev}:{index} ({compute}, {vad_method} VAD)")
     # `language=` is passed at load time when it is known: it skips detection
     # and, more importantly, builds the tokenizer once instead of per call.
-    model = whisperx.load_model(
-        model_name, dev, device_index=index, compute_type=compute,
-        language=source_language)
+    model = load_asr(whisperx, model_name=model_name, device=dev, index=index,
+                     compute=compute, language=source_language,
+                     vad_method=vad_method, log=log)
 
     audio = whisperx.load_audio(media)          # ffmpeg decode: video is fine
     duration = len(audio) / 16000               # whisperx.audio.SAMPLE_RATE
@@ -594,6 +640,9 @@ def main():
                    help="ASR batch size (default: 8, or $WORKER_WHISPER_BATCH)")
     p.add_argument("--no-align", action="store_true",
                    help="skip word alignment (coarse segment timings)")
+    p.add_argument("--vad", default=VAD_METHOD, choices=["silero", "pyannote"],
+                   help=f"voice-activity detector (default: {VAD_METHOD}; "
+                        f"pyannote is broken by whisperx's own dependency pin)")
     p.add_argument("--provider", default="auto",
                    help="auto | gemini | anthropic")
     p.add_argument("--translate-model", default=None,
@@ -613,7 +662,8 @@ def main():
                         compute_type=args.compute_type,
                         batch_size=args.batch_size,
                         source_language=args.source,
-                        align=not args.no_align)
+                        align=not args.no_align,
+                        vad_method=args.vad)
     if not result["segments"]:
         sys.exit("no speech found in this file")
 
