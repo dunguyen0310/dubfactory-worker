@@ -3,6 +3,8 @@
 Two queues, drained in one loop:
   1. voices with status='uploaded'  -> QC, transcribe, encode, audition, cache
   2. jobs   with status='queued'    -> render, verify, assemble, upload
+                                       or, for kind='transcribe',
+                                       transcribe, translate, upload .srt
 
 Progress is written back to the tables the UI already subscribes to, so the
 frontend updates live with no changes.
@@ -659,6 +661,250 @@ def mux_video(sb, job, work, dub_wav):
     return mp4_path, info
 
 
+def require_columns(sb, job, *columns):
+    """Fail early and by name when a feature's migration has not been run.
+
+    The rest of the worker treats missing columns as "degrade politely", which
+    is right for an enhancement like a cached voice prompt. It is wrong here:
+    a transcribe job with nowhere to put the transcript cannot produce anything,
+    and finding that out after transcribing an hour of audio — one silently
+    dropped column at a time — is the expensive way to learn it.
+    """
+    missing = [c for t, c in columns if not has_column(sb, t, c)]
+    if missing:
+        raise RuntimeError(
+            f"this job needs column(s) {', '.join(missing)} — run "
+            f"migrations/20260818_transcribe_jobs.sql in the SQL editor")
+
+
+def transcribe_job(sb, job):
+    """Media in, translated subtitles out.
+
+    The mirror image of render_job: instead of speaking a subtitle file, this
+    produces one. WhisperX transcribes the uploaded media, word-level alignment
+    turns it into subtitle-shaped cues, and the translation lands in
+    `cues.source_text` — the column every later stage already reads as "the line
+    to speak", which is what lets the finished transcript be dubbed by the
+    existing pipeline with no special cases anywhere in it.
+
+    The two stages are kept separately resumable because they fail for
+    completely different reasons and cost completely different amounts.
+    Transcription needs a GPU and minutes; translation needs an API key and
+    cents. A job requeued because nobody had set GEMINI_API_KEY must not pay for
+    the GPU half twice, so the transcript is committed to the database and
+    uploaded before translation is attempted at all.
+    """
+    import transcribe_video as T
+
+    job_id, owner = job["id"], job["owner_id"]
+    settings = job.get("settings") or {}
+    target = settings.get("language", "Vietnamese")
+    # An explicit source language skips detection and is worth setting when you
+    # know it; "auto" (or absent) detects from the first 30 seconds.
+    source = settings.get("source_language") or None
+    if source in ("auto", ""):
+        source = None
+
+    require_columns(sb, job, ("cues", "transcript_text"),
+                    ("cues", "translated_at"), ("jobs", "transcript_src_path"))
+
+    media_path = job.get("video_path")
+    if not media_path:
+        raise RuntimeError("transcribe job has no media file attached")
+
+    work = Path(tempfile.mkdtemp(prefix=f"tr_{job_id[:8]}_"))
+    set_job(sb, job_id, status="compiling")
+    log(sb, job, "compiling", "Preparing to transcribe")
+
+    rows = (sb.table("cues").select("*").eq("job_id", job_id)
+            .order("idx").execute().data) or []
+    # Completeness is measured against total_cues, which is stamped before the
+    # rows go in. Counting the rows alone cannot tell a finished transcript from
+    # an insert that died half way: both have every row carrying a transcript.
+    expected = job.get("total_cues") or 0
+    complete = bool(rows) and len(rows) == expected and all(
+        (r.get("transcript_text") or "").strip() for r in rows)
+
+    # What the ASR found is written to qc_summary as soon as it is known, not
+    # at the end of the job. Two reasons: a job requeued after a failed
+    # translation has to be able to read the detected language back rather than
+    # reporting None for a transcript it did not redo, and the job page can show
+    # what language was heard while the translation is still running.
+    prior = (job.get("qc_summary") or {}) if complete else {}
+    language = prior.get("source_language")
+    alignment = prior.get("alignment")
+    duration = prior.get("audio_seconds")
+
+    if complete:
+        log(sb, job, "transcribing",
+            f"Reusing the {len(rows)} cue transcript from the previous attempt "
+            f"— only the translation is redone")
+    else:
+        if rows:
+            # A partial transcript cannot be extended: cue boundaries come from
+            # the whole word stream, so a second pass would shape them
+            # differently and the two halves would not line up. Start clean.
+            log(sb, job, "transcribing",
+                f"Discarding {len(rows)} cue(s) from an interrupted transcript")
+            sb.table("cues").delete().eq("job_id", job_id).execute()
+
+        set_job(sb, job_id, status="transcribing")
+        log(sb, job, "transcribing", f"Fetching {Path(media_path).name}")
+        local = work / ("source" + (Path(media_path).suffix.lower() or ".mp4"))
+        local.write_bytes(sb.storage.from_("videos").download(media_path))
+
+        def _asr_log(m):
+            print(f"  [transcribing] {m}", flush=True)
+            touch_job(sb, job, detail="transcribing the audio")
+
+        # WhisperX reports progress per VAD chunk. Routing it through the
+        # heartbeat is what stops the stall sweep handing a long file to a
+        # second worker: an hour of audio is many silent minutes otherwise.
+        result = T.transcribe(
+            str(local),
+            model_name=settings.get("asr_model", T.DEFAULT_MODEL),
+            device=DEVICE,
+            batch_size=int(os.environ.get("WORKER_WHISPER_BATCH", "8")),
+            source_language=source,
+            align=bool(settings.get("align_words", True)),
+            log=_asr_log,
+            tick=lambda pct: touch_job(
+                sb, job, detail=f"transcribing — {pct:.0f}%"),
+        )
+        language, alignment = result["language"], result["alignment"]
+        duration = round(result.get("duration") or 0.0, 2)
+        if not result["segments"]:
+            raise RuntimeError("no speech found in this file")
+
+        cues = T.shape_cues(
+            result["segments"], language=language,
+            max_seconds=float(settings.get("max_cue_seconds", T.MAX_CUE_SECONDS)),
+            max_chars=int(settings.get("max_cue_chars", T.MAX_CUE_CHARS)))
+        if not cues:
+            raise RuntimeError(
+                "nothing survived cue shaping — this file may be music only")
+
+        log(sb, job, "transcribing",
+            f"Heard {len(cues)} line(s) of {language}, {alignment}-level timing",
+            {"language": language, "alignment": alignment, "cues": len(cues)})
+
+        # total_cues before the rows, so an interrupted insert is detectable.
+        set_job(sb, job_id, total_cues=len(cues), done_cues=0,
+                qc_summary={"kind": "transcribe", "source_language": language,
+                            "target_language": target, "alignment": alignment,
+                            "audio_seconds": duration, "cues_total": len(cues)})
+        for i in range(0, len(cues), 500):
+            sb.table("cues").insert([{
+                "owner_id": owner, "job_id": job_id, "idx": c["idx"],
+                "start_ms": c["start_ms"], "end_ms": c["end_ms"],
+                # source_text is what gets spoken, and until translation runs
+                # the honest answer is the original line — never blank, so a
+                # job that fails mid-translation still holds a usable file.
+                "source_text": c["text"], "transcript_text": c["text"],
+                "status": "review" if c["low_confidence"] else "pending",
+                "note": ("low confidence transcription — check this line"
+                         if c["low_confidence"] else None),
+            } for c in cues[i:i + 500]]).execute()
+
+        # The source transcript is uploaded before translation is attempted, so
+        # a missing API key costs the translation and nothing else.
+        srt_src = work / "transcript.src.srt"
+        T.write_srt(cues, srt_src)
+        src_path = f"{owner}/{job_id}/transcript.src.srt"
+        upload_output(sb, src_path, srt_src.read_bytes(), "application/x-subrip")
+        set_job(sb, job_id, transcript_src_path=src_path)
+        log(sb, job, "transcribing", "Source-language transcript saved")
+
+        rows = (sb.table("cues").select("*").eq("job_id", job_id)
+                .order("idx").execute().data)
+
+    # ---------------------------------------------------------- translate
+    refresh_auth(sb)
+    set_job(sb, job_id, status="translating")
+
+    pending = [r for r in rows if not r.get("translated_at")]
+    done_before = len(rows) - len(pending)
+    if done_before:
+        log(sb, job, "translating",
+            f"{done_before} line(s) were already translated — translating "
+            f"the remaining {len(pending)}")
+
+    def _tr_log(m):
+        print(f"  [translating] {m}", flush=True)
+        touch_job(sb, job, detail="translating")
+
+    translated = 0
+    if pending:
+        probes = [{"idx": r["idx"], "text": r.get("transcript_text") or
+                   r["source_text"]} for r in pending]
+        by_idx = {r["idx"]: r for r in pending}
+        out = T.translate_cues(
+            probes, language=target,
+            provider=settings.get("translate_provider",
+                                  settings.get("adapt_provider", "auto")),
+            model=settings.get("translate_model"),
+            log=_tr_log,
+            tick=lambda: touch_job(sb, job, detail="translating"))
+        stamp = now_iso()
+        for idx, text in out.items():
+            row = by_idx.get(idx)
+            if row is None:
+                continue
+            sb.table("cues").update({
+                "source_text": text, "translated_at": stamp,
+                # A translated line is no longer waiting on anything; keep the
+                # review flag only where the transcription itself was doubtful.
+                "status": row.get("status") or "pending",
+            }).eq("id", row["id"]).execute()
+            row["source_text"], row["translated_at"] = text, stamp
+            translated += 1
+        set_job_progress(sb, job_id, done_cues=done_before + translated)
+
+    untranslated = len(rows) - done_before - translated
+    if untranslated:
+        # Said out loud rather than left to be noticed on the job page: those
+        # lines are still in the file, in the source language.
+        log(sb, job, "translating",
+            f"{untranslated} line(s) could not be translated and keep their "
+            f"original wording")
+
+    # ------------------------------------------------------------- deliver
+    refresh_auth(sb, force=True)
+    cues_out = [{"idx": r["idx"], "start_ms": r["start_ms"],
+                 "end_ms": r["end_ms"], "text": r["source_text"]}
+                for r in sorted(rows, key=lambda r: r["idx"])]
+    srt_out = work / "transcript.vi.srt"
+    T.write_srt(cues_out, srt_out)
+    out_path = f"{owner}/{job_id}/transcript.{target[:2].lower()}.srt"
+    upload_output(sb, out_path, srt_out.read_bytes(), "application/x-subrip")
+
+    review = sum(1 for r in rows if r.get("status") == "review")
+    qc = {
+        "kind": "transcribe",
+        "source_language": language,
+        "target_language": target,
+        "alignment": alignment,
+        "audio_seconds": duration,
+        "cues_total": len(rows),
+        "cues_translated": done_before + translated,
+        "cues_untranslated": untranslated,
+        "cues_needing_review": review,
+        "srt_seconds": round(max((r["end_ms"] for r in rows), default=0) / 1000, 2),
+    }
+    fields = {"status": "done", "error": None, "srt_out_path": out_path,
+              "done_cues": done_before + translated, "review_cues": review,
+              "qc_summary": qc}
+    try:
+        set_job(sb, job_id, **fields)
+    except Exception:
+        refresh_auth(sb, force=True)
+        set_job(sb, job_id, **fields)
+    _stats["jobs"] += 1
+    log(sb, job, "done",
+        f"{len(rows)} subtitle line(s) in {target}"
+        + (f", {review} to check" if review else ""), qc)
+
+
 def render_job(sb, job):
     job_id, owner = job["id"], job["owner_id"]
     settings = job.get("settings") or {}
@@ -1133,7 +1379,14 @@ def main():
                 beat(sb, "busy", job_id=job["id"], detail=job["title"], force=True)
                 jt = time.time()
                 try:
-                    render_job(sb, job)
+                    # Two different jobs share the queue: one turns subtitles
+                    # into speech, the other turns speech into subtitles. The
+                    # claim, the heartbeat, the presence row and the failure
+                    # handling are identical, so only the middle differs.
+                    if (job.get("kind") or "subtitles") == "transcribe":
+                        transcribe_job(sb, job)
+                    else:
+                        render_job(sb, job)
                     print(f"=== done in {time.time()-jt:.0f}s ===", flush=True)
                 except Exception as e:
                     traceback.print_exc()
