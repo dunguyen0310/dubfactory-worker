@@ -1,0 +1,654 @@
+"""Transcribe a video, translate it, write a subtitle file.
+
+The other half of the pipeline. `srt_dub.py` turns a subtitle file into speech;
+this turns speech into a subtitle file, so an episode that arrives with no .srt
+at all can still be dubbed:
+
+    media -> WhisperX ASR -> word-level alignment -> subtitle-shaped cues
+          -> LLM translation -> .srt in the target language
+
+    python transcribe_video.py --video ep1.mp4 --output ep1.vi.srt
+    python transcribe_video.py --video ep1.mp4 --dry-run    # ASR only, no API key
+    python transcribe_video.py --video ep1.mp4 --source en --model large-v3
+
+Why WhisperX rather than plain Whisper: Whisper emits segments up to 30 seconds
+long with timestamps drifting by seconds, which is unusable as subtitles and
+worse than unusable as dubbing timings. WhisperX forced-aligns the transcript
+against a phoneme model to get a timestamp per *word*, which is what makes
+`shape_cues` below able to cut cues at real speech boundaries.
+
+Translation reuses `adapt_srt.py`'s provider layer — the same Gemini/Claude
+clients, key discovery and JSON schema that the adaptation step uses, so a
+worker configured for one is configured for both.
+
+The three stages are separable on purpose. `--dry-run` stops after alignment
+and writes the source-language transcript, which needs a GPU but no API key;
+translation needs a key but no GPU. The worker exploits the same split to make
+a requeue redo only the cheap half.
+"""
+
+import argparse
+import gc
+import json
+import os
+import sys
+from pathlib import Path
+
+import srt_dub as S
+
+# Subtitle shaping defaults. Two lines of 42 characters is the long-standing
+# convention (Netflix, BBC and most broadcast guides land within a character or
+# two of it), and 6 seconds is about how long a viewer needs for a full one.
+MAX_CUE_SECONDS = 6.0
+MAX_CUE_CHARS = 84
+MIN_CUE_SECONDS = 1.0
+
+# A gap this long inside a segment is a real pause — a clause boundary the
+# speaker actually made — and is a better place to cut than any character count.
+PAUSE_BREAK = 0.6
+
+# Alignment gives each word a 0..1 confidence. Below this the timing (and often
+# the word) is guesswork, so the cue is flagged for human review rather than
+# quietly shipped; below WORD_JUNK_SCORE across a whole cue it is dropped, which
+# is how Whisper's hallucinations on music and silence get filtered.
+LOW_SCORE = 0.5
+WORD_JUNK_SCORE = 0.2
+
+# Padding around a cue's word boundaries. Alignment lands on the phoneme, and
+# starting a subtitle exactly there reads as late.
+PAD_SECONDS = 0.04
+
+SENTENCE_END = tuple(".?!…。！？")
+# Whisper writes these languages without spaces, so "words" are characters and
+# joining them with a space would corrupt the text.
+NO_SPACE_LANGS = {"ja", "zh", "yue", "th", "lo", "my", "km"}
+
+DEFAULT_MODEL = "large-v3"
+BATCH = 25              # cues per translation call, same as adapt_srt
+
+
+# ------------------------------------------------------------------- device
+
+def pick_device(device: str | None = None) -> tuple[str, int]:
+    """Split a torch-style device string into what CTranslate2 wants.
+
+    The worker's OMNIVOICE_DEVICE is "cuda:0", but faster-whisper takes the
+    index separately and rejects "cuda:0" as a device name. Getting this wrong
+    fails at model load with an opaque error, so it is done in one place.
+    """
+    spec = device or os.environ.get("OMNIVOICE_DEVICE") or "cuda"
+    name, _, index = spec.partition(":")
+    if name == "cuda":
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                name = "cpu"
+        except ImportError:
+            name = "cpu"
+    return name, (int(index) if index.isdigit() else 0)
+
+
+def pick_compute_type(device: str, index: int = 0) -> str:
+    """float16 where there is room for it, int8 where there is not.
+
+    large-v3 is ~3 GB in fp16 and ~1.5 GB in int8. The 8 GB cards this runs on
+    also hold OmniVoice (2.1 GB) for the dub that usually follows, so the
+    threshold is set where both fit at once rather than where WhisperX alone
+    would.
+    """
+    if device != "cuda":
+        return "int8"
+    try:
+        import torch
+        vram = torch.cuda.get_device_properties(index).total_memory / 1e9
+        return "float16" if vram >= 10 else "int8_float16"
+    except Exception:
+        return "float16"
+
+
+def free_gpu():
+    """Release VRAM between stages.
+
+    Not optional: the ASR model, the alignment model and (in the worker)
+    OmniVoice all want the same card, and the worker transcribes a job and then
+    renders the next one in the same process. Without this the second job OOMs
+    on a machine that had plenty of room for either model alone.
+    """
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- transcribe
+
+def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
+               compute_type: str | None = None, batch_size: int = 8,
+               source_language: str | None = None, align: bool = True,
+               log=print, tick=None) -> dict:
+    """Run ASR and word alignment over a media file.
+
+    Returns {"language", "segments", "alignment"} where each segment is
+    {"text", "start", "end", "words": [{"word", "start", "end", "score"}]}.
+
+    `alignment` is "word" or "segment". It is not decoration: a language with
+    no alignment model still transcribes fine but its timings are Whisper's
+    coarse segment boundaries, and every consumer of this — the cue shaper, the
+    job's QC summary, whoever reads the .srt — needs to know which it got.
+    """
+    try:
+        import whisperx
+    except ImportError as e:
+        raise RuntimeError(
+            "WhisperX is not installed on this machine:\n"
+            "    pip install whisperx\n"
+            "(needs Python 3.10-3.13 and, for GPU, a CUDA build of torch)"
+        ) from e
+
+    dev, index = pick_device(device)
+    compute = compute_type or pick_compute_type(dev, index)
+    if dev == "cpu":
+        log("no CUDA device — transcribing on the CPU, which is many times "
+            "slower than realtime")
+
+    log(f"loading {model_name} on {dev}:{index} ({compute})")
+    # `language=` is passed at load time when it is known: it skips detection
+    # and, more importantly, builds the tokenizer once instead of per call.
+    model = whisperx.load_model(
+        model_name, dev, device_index=index, compute_type=compute,
+        language=source_language)
+
+    audio = whisperx.load_audio(media)          # ffmpeg decode: video is fine
+    duration = len(audio) / 16000               # whisperx.audio.SAMPLE_RATE
+    log(f"{duration / 60:.1f} min of audio")
+
+    try:
+        result = model.transcribe(
+            audio, batch_size=batch_size, language=source_language,
+            # Fires per VAD chunk. This is what keeps the worker's stall sweep
+            # from mistaking a long transcription for a dead session.
+            progress_callback=(lambda pct: tick(pct)) if tick else None)
+    finally:
+        del model
+        free_gpu()
+
+    language = result.get("language") or source_language or "en"
+    segments = result.get("segments") or []
+    log(f"{len(segments)} segment(s), language {language}")
+    if not segments:
+        return {"language": language, "segments": [], "alignment": "none",
+                "duration": duration}
+
+    alignment = "segment"
+    if align:
+        try:
+            amodel, meta = whisperx.load_align_model(language, dev)
+        except Exception as e:
+            # A language with no default alignment model is the expected case
+            # here, and it must not fail the job: Whisper's segment timings are
+            # coarse but usable, and a subtitle file with coarse timings beats
+            # no subtitle file. Reported, not raised.
+            log(f"no alignment model for {language!r} ({str(e)[:120]}) — "
+                f"keeping Whisper's segment timings")
+        else:
+            try:
+                aligned = whisperx.align(
+                    segments, amodel, meta, audio, dev,
+                    return_char_alignments=False,
+                    progress_callback=(lambda pct: tick(pct)) if tick else None)
+                segments = aligned.get("segments") or segments
+                alignment = "word"
+                log("word-level alignment done")
+            except Exception as e:
+                log(f"alignment failed ({str(e)[:120]}) — keeping segment timings")
+            finally:
+                del amodel
+                free_gpu()
+
+    return {"language": language, "segments": segments, "alignment": alignment,
+            "duration": duration}
+
+
+# --------------------------------------------------------------- cue shaping
+
+def _words_with_times(segment: dict) -> list[dict]:
+    """Every word in a segment, each with a usable start and end.
+
+    Alignment omits `start`/`end` on a word it could not place — a digit, a
+    foreign name, anything outside the phoneme model's dictionary — and
+    interpolates only when at least one word in the sentence was placed. So
+    unplaced words arrive here with the keys simply missing, and reading them
+    directly is how the shaper would crash on real input. They are given the
+    time of whatever is around them: a word with no timestamp still has to be
+    spoken, and dropping it would lose text from the transcript.
+    """
+    words = [dict(w) for w in (segment.get("words") or [])
+             if str(w.get("word", "")).strip()]
+    if not words:
+        return []
+
+    lo = float(segment.get("start") or 0.0)
+    hi = float(segment.get("end") or lo)
+
+    # Forward pass: an unplaced word starts where the last placed one ended.
+    cursor = lo
+    for w in words:
+        if w.get("start") is None:
+            w["start"] = cursor
+        if w.get("end") is None:
+            w["end"] = w["start"]
+        w["start"] = float(w["start"])
+        w["end"] = max(float(w["end"]), w["start"])
+        cursor = w["end"]
+
+    # Backward pass: a run of unplaced words at the end of a segment would all
+    # sit on the last placed timestamp with zero duration. Spread them over
+    # whatever is left of the segment instead.
+    tail = [w for w in words if w["end"] <= w["start"]]
+    if tail and hi > words[-1]["start"]:
+        span = (hi - words[-1]["start"]) / len(tail)
+        for n, w in enumerate(tail, 1):
+            w["end"] = w["start"] + span * n
+    return words
+
+
+def _join(words: list[dict], language: str) -> str:
+    sep = "" if language in NO_SPACE_LANGS else " "
+    return sep.join(str(w["word"]).strip() for w in words).strip()
+
+
+def _mean_score(words: list[dict]) -> float | None:
+    scores = [float(w["score"]) for w in words
+              if w.get("score") is not None]
+    return round(sum(scores) / len(scores), 3) if scores else None
+
+
+def shape_cues(segments: list[dict], *, language: str = "en",
+               max_seconds: float = MAX_CUE_SECONDS,
+               max_chars: int = MAX_CUE_CHARS,
+               min_seconds: float = MIN_CUE_SECONDS,
+               pause_break: float = PAUSE_BREAK) -> list[dict]:
+    """Turn aligned segments into subtitle-shaped cues.
+
+    Whisper's segments are VAD chunks of up to 30 seconds — far too long to
+    read, and far too long to dub, since one overlong cue drags every line
+    after it out of sync. This cuts them at the places a viewer expects: the
+    end of a sentence, a pause the speaker actually made, and failing both, the
+    last word that still fits.
+
+    Returns dicts of {idx, start_ms, end_ms, text, score, low_confidence},
+    which is exactly the shape `cues` rows and the .srt writer both need.
+
+    A segment with no word timings (alignment unavailable or failed for that
+    line) is emitted whole rather than dropped — coarse timing, all the text.
+    """
+    rough: list[dict] = []
+
+    for segment in segments:
+        words = _words_with_times(segment)
+        if not words:
+            text = str(segment.get("text") or "").strip()
+            if text:
+                rough.append({
+                    "start": float(segment.get("start") or 0.0),
+                    "end": float(segment.get("end") or 0.0),
+                    "words": [], "text": text, "score": None,
+                })
+            continue
+
+        # Hallucinated text over music or silence aligns terribly against a
+        # phoneme model, which is the cheapest signal we have for it.
+        score = _mean_score(words)
+        if score is not None and score < WORD_JUNK_SCORE:
+            continue
+
+        current: list[dict] = []
+        for word in words:
+            if current:
+                gap = word["start"] - current[-1]["end"]
+                span = word["end"] - current[0]["start"]
+                chars = len(_join(current + [word], language))
+                if (gap >= pause_break or span > max_seconds
+                        or chars > max_chars):
+                    rough.append({"words": current})
+                    current = []
+            current.append(word)
+            # Cut after a sentence ends, but only once there is enough text to
+            # be worth a cue of its own; "Oh." on its own line is a flicker.
+            if (str(word["word"]).strip().endswith(SENTENCE_END)
+                    and len(_join(current, language)) >= max_chars // 3):
+                rough.append({"words": current})
+                current = []
+        if current:
+            rough.append({"words": current})
+
+    # Fill in text and timings for the word-based cues.
+    for cue in rough:
+        if cue.get("text") is None or "text" not in cue:
+            words = cue["words"]
+            cue["text"] = _join(words, language)
+            cue["start"] = words[0]["start"]
+            cue["end"] = words[-1]["end"]
+            cue["score"] = _mean_score(words)
+
+    cues = [c for c in rough if c["text"]]
+    cues = _merge_slivers(cues, language, max_seconds, max_chars, pause_break)
+    return _finalise(cues, min_seconds)
+
+
+def _merge_slivers(cues: list[dict], language: str, max_seconds: float,
+                   max_chars: int, pause_break: float) -> list[dict]:
+    """Fold a too-short cue into the previous one when it belongs there.
+
+    Sentence-end cuts produce these — a trailing "Right." after a full line —
+    and a cue that flashes for a third of a second is worse than a slightly
+    longer one.
+
+    What it must not do is merge across silence. A short line separated from
+    the one before it by a real pause is a *separate utterance*: "Yes." and
+    "No." a second apart are two answers, not one cue, and gluing them together
+    both misreads the dialogue and undoes the pause break that shape_cues just
+    made deliberately. So the gap is checked first, and only speech that runs
+    on can be merged.
+    """
+    if not cues:
+        return cues
+    sep = "" if language in NO_SPACE_LANGS else " "
+    out: list[dict] = []
+    for cue in cues:
+        prev = out[-1] if out else None
+        short = (cue["end"] - cue["start"]) < 0.7 or len(cue["text"]) < 12
+        if prev and short and (cue["start"] - prev["end"]) < pause_break:
+            merged_text = f"{prev['text']}{sep}{cue['text']}".strip()
+            if (len(merged_text) <= max_chars
+                    and cue["end"] - prev["start"] <= max_seconds):
+                prev["text"] = merged_text
+                prev["end"] = cue["end"]
+                prev["words"] = (prev.get("words") or []) + (cue.get("words") or [])
+                prev["score"] = _mean_score(prev["words"]) or prev.get("score")
+                continue
+        out.append(cue)
+    return out
+
+
+def _finalise(cues: list[dict], min_seconds: float) -> list[dict]:
+    """Pad, enforce a readable minimum duration, number, and flag.
+
+    Padding only ever consumes silence. Alignment lands on the phoneme and a
+    subtitle that appears exactly there reads as late, so a cue is nudged
+    outwards — but consecutive words inside a sentence are contiguous, one's end
+    being the next one's start, so padding both sides unconditionally would
+    make every cue overlap its neighbour. Each side therefore takes at most half
+    of whatever gap actually exists, which leaves untouched timings untouched
+    and still gives the lead-in wherever the speaker paused.
+    """
+    if not cues:
+        return []
+
+    starts, ends = [], []
+    for i, cue in enumerate(cues):
+        prev_end = cues[i - 1]["end"] if i else 0.0
+        lead = min(PAD_SECONDS, max(0.0, (cue["start"] - prev_end) / 2))
+        starts.append(max(0.0, cue["start"] - lead))
+
+    for i, cue in enumerate(cues):
+        # The ceiling is the *padded* start of the next cue, not its raw one:
+        # clamping against the raw start would leave room for the next cue's
+        # own lead-in to reach back across this cue's end.
+        ceiling = starts[i + 1] if i + 1 < len(cues) else None
+        end = cue["end"] + PAD_SECONDS
+        if end - starts[i] < min_seconds:
+            end = starts[i] + min_seconds
+        if ceiling is not None:
+            end = min(end, ceiling)
+        ends.append(end)
+
+    final = []
+    for n, (cue, start, end) in enumerate(zip(cues, starts, ends), 1):
+        # Last guard against a zero- or negative-length cue. Overlapping ASR
+        # segments are rare but not impossible, and a cue with end <= start is
+        # invalid .srt that a player will either skip or choke on — while
+        # dropping the cue would lose transcript text. One millisecond is
+        # enough to keep the file valid and the line present.
+        if end <= start:
+            end = start + 0.001
+        score = cue.get("score")
+        final.append({
+            "idx": n,
+            "start_ms": int(round(start * 1000)),
+            "end_ms": int(round(end * 1000)),
+            "text": cue["text"],
+            "score": score,
+            "low_confidence": score is not None and score < LOW_SCORE,
+        })
+    return final
+
+
+# ---------------------------------------------------------------- translation
+
+SYSTEM = """You are a professional subtitle translator. You translate \
+transcribed speech into natural, idiomatic {language} for subtitles that will \
+also be read aloud by a dubbing engine.
+
+Rules, in priority order:
+1. Translate the meaning, not the words. Write what a native {language} \
+speaker would actually say in that situation.
+2. Keep proper nouns, brand names and product names as they are normally \
+written in {language}.
+3. Match the register of the original — casual speech stays casual, formal \
+stays formal.
+4. One cue in, one cue out. Never merge two cues or split one, and never add \
+information that is not in the source: each line has its own time slot on \
+screen.
+5. Keep numbers as digits. These are subtitles; a later step spells them out \
+if the line is going to be spoken.
+6. Transcribed speech contains false starts, filler and repetition. Keep them \
+only where they carry meaning; a stutter that is only noise can be smoothed.
+7. If a line is untranslatable noise (a mis-heard fragment, music), return it \
+unchanged rather than inventing content.
+
+The CONTEXT lines are there so pronouns, names and register stay consistent \
+across cues. Do not translate them — they are not yours to return.
+
+Return every cue you were asked for, by index."""
+
+
+def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
+                   context=2, log=print, tick=None) -> dict[int, str]:
+    """Translate cue texts. Returns {index: translated text}.
+
+    Importable entry point — worker.py calls this as its second stage.
+
+    Reuses adapt_srt's provider clients, so the same GEMINI_API_KEY or
+    ANTHROPIC_API_KEY that enables adaptation enables this, and the JSON schema
+    both providers are held to is already the {cues:[{index,text}]} shape this
+    wants.
+
+    `cues` is any sequence of objects with `.index`/`["idx"]` and text; each
+    batch is shown a couple of neighbouring lines as read-only context, because
+    a subtitle cue in isolation loses the antecedent of every pronoun in it.
+    """
+    import adapt_srt as A
+
+    items = [(_cue_index(c), _cue_text(c)) for c in cues]
+    items = [(i, t) for i, t in items if t.strip()]
+    if not items:
+        return {}
+
+    client = A.make_client(provider, model)
+    system = SYSTEM.replace("{language}", language)
+    log(f"translating {len(items)} line(s) to {language} "
+        f"with {client.name}/{client.model}")
+
+    by_index = dict(items)
+    out: dict[int, str] = {}
+    for start in range(0, len(items), BATCH):
+        batch = items[start:start + BATCH]
+        before = items[max(0, start - context):start]
+        after = items[start + len(batch):start + len(batch) + context]
+
+        lines = []
+        for i, t in before:
+            lines.append(f"CONTEXT [{i}]: {t}")
+        for i, t in batch:
+            lines.append(f"[{i}] {t}")
+        for i, t in after:
+            lines.append(f"CONTEXT [{i}]: {t}")
+
+        prompt = (f"Translate these subtitle cues into {language}.\n\n"
+                  + "\n".join(lines))
+        payload = json.loads(client.complete(system, prompt))
+        for row in payload.get("cues") or []:
+            idx, text = row.get("index"), str(row.get("text") or "").strip()
+            # Ignore anything outside the batch: a model that helpfully
+            # translates the context lines too would otherwise overwrite good
+            # translations with ones made without their own context.
+            if text and idx in dict(batch):
+                out[idx] = text
+        if tick:
+            tick()
+        log(f"  {len(out)}/{len(items)} translated")
+
+    missing = [i for i, _ in items if i not in out]
+    if missing:
+        # One narrow retry. A dropped line is usually one batch misbehaving,
+        # and re-asking for just the gaps is cheap; what is not acceptable is
+        # shipping a subtitle file with holes in it and not saying so.
+        log(f"  {len(missing)} line(s) came back empty — retrying those")
+        for start in range(0, len(missing), BATCH):
+            chunk = [(i, by_index[i]) for i in missing[start:start + BATCH]]
+            prompt = (f"Translate these subtitle cues into {language}. "
+                      f"Return all {len(chunk)} of them.\n\n"
+                      + "\n".join(f"[{i}] {t}" for i, t in chunk))
+            try:
+                payload = json.loads(client.complete(system, prompt))
+            except Exception as e:
+                log(f"  retry batch failed: {str(e)[:120]}")
+                continue
+            for row in payload.get("cues") or []:
+                idx, text = row.get("index"), str(row.get("text") or "").strip()
+                if text and idx in dict(chunk):
+                    out[idx] = text
+            if tick:
+                tick()
+
+    still = [i for i, _ in items if i not in out]
+    if still:
+        log(f"  {len(still)} line(s) left untranslated: {still[:20]}"
+            f"{' …' if len(still) > 20 else ''} — they keep the source text")
+    return out
+
+
+def _cue_index(c) -> int:
+    return int(c["idx"] if isinstance(c, dict) else c.index)
+
+
+def _cue_text(c) -> str:
+    if isinstance(c, dict):
+        return str(c.get("text") or "")
+    return str(c.text)
+
+
+# ---------------------------------------------------------------------- srt
+
+def write_srt(cues, path, translations: dict[int, str] | None = None):
+    """Write cues as an .srt. Timings come from the cues, text from the
+    translation when there is one and the transcript when there is not — a
+    partially translated file is still a usable file."""
+    translations = translations or {}
+    with open(path, "w", encoding="utf-8") as f:
+        for n, c in enumerate(cues, 1):
+            idx = _cue_index(c)
+            text = translations.get(idx) or _cue_text(c)
+            f.write(f"{n}\n"
+                    f"{S.fmt_ts(c['start_ms'] / 1000)} --> "
+                    f"{S.fmt_ts(c['end_ms'] / 1000)}\n{text}\n\n")
+
+
+# ---------------------------------------------------------------------- cli
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--video", "--media", dest="media", required=True,
+                   help="source video or audio (anything ffmpeg reads)")
+    p.add_argument("--output", help="translated .srt "
+                                    "(default: <input>.<lang>.srt)")
+    p.add_argument("--transcript", help="also write the source-language .srt "
+                                        "here (default: <input>.src.srt)")
+    p.add_argument("--target", default="Vietnamese",
+                   help="language to translate into (default: Vietnamese)")
+    p.add_argument("--source", default=None,
+                   help="source language code, e.g. en. Default: detect")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help=f"Whisper model (default: {DEFAULT_MODEL})")
+    p.add_argument("--device", default=None, help="cuda, cuda:1, cpu")
+    p.add_argument("--compute-type", default=None,
+                   help="float16 | int8_float16 | int8 (default: by VRAM)")
+    p.add_argument("--batch-size", type=int,
+                   default=int(os.environ.get("WORKER_WHISPER_BATCH", "8")),
+                   help="ASR batch size (default: 8, or $WORKER_WHISPER_BATCH)")
+    p.add_argument("--no-align", action="store_true",
+                   help="skip word alignment (coarse segment timings)")
+    p.add_argument("--provider", default="auto",
+                   help="auto | gemini | anthropic")
+    p.add_argument("--translate-model", default=None,
+                   help="model id for the translation step")
+    p.add_argument("--max-seconds", type=float, default=MAX_CUE_SECONDS)
+    p.add_argument("--max-chars", type=int, default=MAX_CUE_CHARS)
+    p.add_argument("--dry-run", action="store_true",
+                   help="transcribe only — writes the source-language .srt "
+                        "and needs no API key")
+    args = p.parse_args()
+
+    media = Path(args.media)
+    if not media.exists():
+        sys.exit(f"no such file: {media}")
+
+    result = transcribe(str(media), model_name=args.model, device=args.device,
+                        compute_type=args.compute_type,
+                        batch_size=args.batch_size,
+                        source_language=args.source,
+                        align=not args.no_align)
+    if not result["segments"]:
+        sys.exit("no speech found in this file")
+
+    cues = shape_cues(result["segments"], language=result["language"],
+                      max_seconds=args.max_seconds, max_chars=args.max_chars)
+    if not cues:
+        sys.exit("nothing survived cue shaping — the audio may be music only")
+
+    low = sum(1 for c in cues if c["low_confidence"])
+    span = cues[-1]["end_ms"] / 1000
+    print(f"\n{len(cues)} cues, {span:.1f}s, {result['alignment']} timing"
+          + (f", {low} low-confidence" if low else ""))
+
+    src_path = args.transcript or str(media.with_suffix(".src.srt"))
+    write_srt(cues, src_path)
+    print(f"wrote {src_path} ({result['language']})")
+
+    if args.dry_run:
+        print("\n--dry-run: stopping before translation")
+        return
+
+    import adapt_srt as A
+    try:
+        translations = translate_cues(
+            cues, language=args.target, provider=args.provider,
+            model=args.translate_model)
+    except (A.NoCredentials, A.BadModel) as e:
+        sys.exit(f"{e}\n\n(--dry-run transcribes with no API key at all.)")
+
+    out = args.output or str(media.with_suffix(f".{args.target[:2].lower()}.srt"))
+    write_srt(cues, out, translations)
+    done = len(translations)
+    print(f"wrote {out} — {done}/{len(cues)} lines translated"
+          + (f", {len(cues) - done} kept as transcribed" if done < len(cues) else ""))
+
+
+if __name__ == "__main__":
+    main()
