@@ -200,7 +200,13 @@ def install_stubs(monkey, *, translate=True, calls=None):
         calls["translate"] = calls.get("translate", 0) + 1
         if not translate:
             raise T_NoCredentials("no API key configured")
-        return {T._cue_index(c): f"[vi] {T._cue_text(c)}" for c in cues}
+        out = {T._cue_index(c): f"[vi] {T._cue_text(c)}" for c in cues}
+        # The real translate_cues persists per batch through this callback,
+        # and the worker now relies on it — a stub that only returns would
+        # leave every cue unstamped and fail the assertions that matter.
+        if kw.get("flush"):
+            kw["flush"](out)
+        return out
 
     monkey.append((T, "transcribe", T.transcribe))
     monkey.append((T, "translate_cues", T.translate_cues))
@@ -380,7 +386,10 @@ def _():
     # A provider that translates only the first cue — the partial-failure case.
     def half(cues, **kw):
         cues = list(cues)
-        return {T._cue_index(cues[0]): "[vi] only one"}
+        out = {T._cue_index(cues[0]): "[vi] only one"}
+        if kw.get("flush"):
+            kw["flush"](out)
+        return out
     T.translate_cues = half
     W._COLS.clear()
     W._beat.update(at=0.0, on=False)

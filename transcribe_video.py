@@ -32,6 +32,7 @@ import gc
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import srt_dub as S
@@ -531,6 +532,62 @@ def _finalise(cues: list[dict], min_seconds: float) -> list[dict]:
 
 # ---------------------------------------------------------------- translation
 
+# Waits between attempts when the translation provider returns a transient
+# error. Gemini's 503 "high demand" failed a whole job once, after the GPU work
+# was already done; "spikes in demand are usually temporary" is Google's own
+# wording, so a couple of minutes of patience is the difference between a
+# finished job and a requeue.
+RETRY_DELAYS = (5, 15, 45, 90)
+
+
+def _transient(exc: BaseException) -> bool:
+    """Whether an API failure is worth retrying.
+
+    Overload, rate limiting and gateway errors pass; everything else — bad
+    JSON, refused batches, revoked keys — fails fast, because retrying those
+    just delays the real error. Checked by status attribute first, then by the
+    strings the two SDKs actually put in their messages.
+    """
+    for attr in ("status_code", "code", "status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int) and v in (429, 500, 502, 503, 504):
+            return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in (
+        "503", "unavailable", "overloaded", "high demand", "429",
+        "resource_exhausted", "rate limit", "502", "504", "timed out",
+        "timeout", "internal server error", "500 internal"))
+
+
+def _complete_retry(client, system, prompt, *, log=print, tick=None) -> str:
+    """client.complete with backoff on transient provider errors.
+
+    Raises the original error immediately when it is not transient, and an
+    actionable RuntimeError when patience runs out — one that says the
+    transcript is safe, because that is the first thing anyone reading the
+    failed job needs to know.
+    """
+    last = None
+    for attempt, delay in enumerate((0,) + RETRY_DELAYS):
+        if delay:
+            log(f"  provider busy — retrying in {delay}s "
+                f"(attempt {attempt + 1} of {len(RETRY_DELAYS) + 1})")
+            if tick:
+                tick()          # heartbeat through the wait
+            time.sleep(delay)
+        try:
+            return client.complete(system, prompt)
+        except Exception as e:
+            if not _transient(e):
+                raise
+            last = e
+    raise RuntimeError(
+        f"The translation service is unavailable ({_why(last)}) — gave up "
+        f"after {len(RETRY_DELAYS) + 1} attempts. The transcript is already "
+        f"saved, so requeue the job and only the translation is redone."
+    ) from last
+
+
 SYSTEM = """You are a professional subtitle translator. You translate \
 transcribed speech into natural, idiomatic {language} for subtitles that will \
 also be read aloud by a dubbing engine.
@@ -559,7 +616,7 @@ Return every cue you were asked for, by index."""
 
 
 def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
-                   context=2, log=print, tick=None) -> dict[int, str]:
+                   context=2, log=print, tick=None, flush=None) -> dict[int, str]:
     """Translate cue texts. Returns {index: translated text}.
 
     Importable entry point — worker.py calls this as its second stage.
@@ -572,6 +629,12 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
     `cues` is any sequence of objects with `.index`/`["idx"]` and text; each
     batch is shown a couple of neighbouring lines as read-only context, because
     a subtitle cue in isolation loses the antecedent of every pronoun in it.
+
+    `flush`, if given, is called with each batch's {index: text} the moment it
+    exists. Translation is minutes of API calls that can die halfway — measured:
+    Gemini returning 503 mid-episode — and work that lives only in this dict
+    dies with it. The worker persists per batch through this, so a requeue
+    re-translates only what is actually missing.
     """
     import adapt_srt as A
 
@@ -602,14 +665,19 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
 
         prompt = (f"Translate these subtitle cues into {language}.\n\n"
                   + "\n".join(lines))
-        payload = json.loads(client.complete(system, prompt))
+        payload = json.loads(_complete_retry(client, system, prompt,
+                                             log=log, tick=tick))
+        got = {}
         for row in payload.get("cues") or []:
             idx, text = row.get("index"), str(row.get("text") or "").strip()
             # Ignore anything outside the batch: a model that helpfully
             # translates the context lines too would otherwise overwrite good
             # translations with ones made without their own context.
             if text and idx in dict(batch):
-                out[idx] = text
+                got[idx] = text
+        out.update(got)
+        if flush and got:
+            flush(got)
         if tick:
             tick()
         log(f"  {len(out)}/{len(items)} translated")
@@ -626,14 +694,22 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
                       f"Return all {len(chunk)} of them.\n\n"
                       + "\n".join(f"[{i}] {t}" for i, t in chunk))
             try:
-                payload = json.loads(client.complete(system, prompt))
+                payload = json.loads(_complete_retry(client, system, prompt,
+                                                     log=log, tick=tick))
             except Exception as e:
+                # Non-fatal by design: a line that stays untranslated keeps its
+                # transcript text and is counted, which beats failing a job
+                # that is 96% translated over its last stubborn batch.
                 log(f"  retry batch failed: {str(e)[:120]}")
                 continue
+            got = {}
             for row in payload.get("cues") or []:
                 idx, text = row.get("index"), str(row.get("text") or "").strip()
                 if text and idx in dict(chunk):
-                    out[idx] = text
+                    got[idx] = text
+            out.update(got)
+            if flush and got:
+                flush(got)
             if tick:
                 tick()
 
@@ -748,6 +824,10 @@ def main():
             model=args.translate_model)
     except (A.NoCredentials, A.BadModel) as e:
         sys.exit(f"{e}\n\n(--dry-run transcribes with no API key at all.)")
+    except RuntimeError as e:
+        # Exhausted retries against a provider outage. The transcript .srt is
+        # already on disk at this point, so say so instead of stack-tracing.
+        sys.exit(str(e))
 
     out = args.output or str(media.with_suffix(f".{args.target[:2].lower()}.srt"))
     write_srt(cues, out, translations)

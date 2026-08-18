@@ -839,27 +839,40 @@ def transcribe_job(sb, job):
         probes = [{"idx": r["idx"], "text": r.get("transcript_text") or
                    r["source_text"]} for r in pending]
         by_idx = {r["idx"]: r for r in pending}
-        out = T.translate_cues(
+
+        def persist(batch):
+            """Write one batch of translations the moment it exists.
+
+            Translation is minutes of API calls that can die halfway —
+            measured: Gemini returning 503 mid-episode — and work that only
+            lives in a local dict dies with it. Persisted per batch, a requeued
+            job re-translates only what is actually missing, and done_cues
+            moves while the job runs instead of jumping at the end.
+            """
+            nonlocal translated
+            stamp = now_iso()
+            for idx, text in batch.items():
+                row = by_idx.get(idx)
+                if row is None:
+                    continue
+                sb.table("cues").update({
+                    "source_text": text, "translated_at": stamp,
+                    # A translated line is no longer waiting on anything; keep
+                    # the review flag only where the transcription was doubtful.
+                    "status": row.get("status") or "pending",
+                }).eq("id", row["id"]).execute()
+                row["source_text"], row["translated_at"] = text, stamp
+                translated += 1
+            set_job_progress(sb, job_id, done_cues=done_before + translated)
+
+        T.translate_cues(
             probes, language=target,
             provider=settings.get("translate_provider",
                                   settings.get("adapt_provider", "auto")),
             model=settings.get("translate_model"),
             log=_tr_log,
-            tick=lambda: touch_job(sb, job, detail="translating"))
-        stamp = now_iso()
-        for idx, text in out.items():
-            row = by_idx.get(idx)
-            if row is None:
-                continue
-            sb.table("cues").update({
-                "source_text": text, "translated_at": stamp,
-                # A translated line is no longer waiting on anything; keep the
-                # review flag only where the transcription itself was doubtful.
-                "status": row.get("status") or "pending",
-            }).eq("id", row["id"]).execute()
-            row["source_text"], row["translated_at"] = text, stamp
-            translated += 1
-        set_job_progress(sb, job_id, done_cues=done_before + translated)
+            tick=lambda: touch_job(sb, job, detail="translating"),
+            flush=persist)
 
     untranslated = len(rows) - done_before - translated
     if untranslated:
