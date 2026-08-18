@@ -216,6 +216,34 @@ def _():
     assert T.shape_cues([segment([], 1.0, 2.0, text="")], language="en") == []
 
 
+@check("language names resolve to the codes whisperx accepts")
+def _():
+    # The app's picker sends display names; whisperx wants ISO codes. "Chinese"
+    # passed through raw cost a real job — after the GPU model was chosen.
+    assert T.lang_code("Chinese") == "zh"
+    assert T.lang_code("chinese") == "zh"
+    assert T.lang_code("Vietnamese") == "vi"
+    assert T.lang_code("Korean") == "ko"
+    # Codes pass through, including ones outside the map.
+    assert T.lang_code("zh") == "zh"
+    assert T.lang_code("ZH") == "zh"
+    assert T.lang_code("yue") == "yue"
+    assert T.lang_code("haw") == "haw"
+    # Detection, in all the spellings callers use for it.
+    assert T.lang_code(None) is None
+    assert T.lang_code("") is None
+    assert T.lang_code("auto") is None
+    assert T.lang_code("Auto-Detect") is None
+    # An unknown NAME is refused with both accepted forms in the message,
+    # before any model has loaded.
+    try:
+        T.lang_code("Klingon")
+    except ValueError as e:
+        assert "Chinese" in str(e) and "zh" in str(e), e
+    else:
+        raise AssertionError("an unknown name must be refused, not passed on")
+
+
 @check("transient provider errors are retried, real ones are not")
 def _():
     class Boom(Exception):
