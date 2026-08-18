@@ -68,21 +68,24 @@ BATCH = 25              # cues per translation call, same as adapt_srt
 
 # Which voice-activity detector splits the audio before transcription.
 #
-# Silero by default, and not for quality reasons: WhisperX's own pyannote path is
-# broken by its own dependency pin. The VAD checkpoint it ships
-# (whisperx/assets/pytorch_model.bin) is a April-2022 pyannote 2.x segmentation
-# model — class pyannote.audio.models.segmentation.PyanNet, saved with
-# torch 1.10 and pytorch-lightning 1.5.4 — while whisperx 3.8.6 requires
-# pyannote-audio>=4.0.0, which no longer has the classes that checkpoint pickles.
-# Loading it therefore fails with pyannote's
-#     Could not import module 'Pipeline'. Are this object's requirements
-#     defined correctly?
-# which reads like a problem with this code and is not one.
+# Silero by default, because it does not touch the VAD checkpoint whisperx ships.
+# That checkpoint (whisperx/assets/pytorch_model.bin) is a pyannote 2.x
+# segmentation model from April 2022 — class
+# pyannote.audio.models.segmentation.PyanNet, saved with torch 1.10 and
+# pytorch-lightning 1.5.4 — while whisperx 3.8.6 asks for pyannote-audio>=4.0.0.
+# Whether pyannote 4 can still load an artefact that old is not something this
+# code should depend on, and Silero settles it by loading through torch.hub
+# instead, with no pyannote model involved and no Hugging Face token.
 #
-# Silero loads through torch.hub instead, so it touches no pyannote at all and
-# needs no Hugging Face token. `load_asr` tries the other one if the chosen one
-# cannot be built, so a future whisperx that fixes pyannote is picked up by
-# setting settings.vad_method rather than by editing this.
+# What this does NOT work around is pyannote failing to *import*: whisperx pulls
+# vads/pyannote.py in at module scope, so a pyannote that will not import breaks
+# every transcribe job whichever detector is selected. That is a environment
+# problem — pyannote 3.x on torchaudio>=2.9 is the known one — and load_asr
+# reports it rather than pretending a VAD choice could fix it.
+#
+# load_asr tries the other detector if the chosen one cannot be built, so a
+# worker where pyannote works is picked up by setting settings.vad_method
+# rather than by editing this.
 VAD_METHOD = "silero"
 
 
