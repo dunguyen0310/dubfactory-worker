@@ -199,6 +199,23 @@ def _why(exc: BaseException) -> str:
     return " <- caused by ".join(parts[:4])
 
 
+def _accepts(fn, name: str) -> bool:
+    """Whether a callable takes a given keyword.
+
+    whisperx's signatures move between versions, and a keyword it does not know
+    is a TypeError that costs the whole job. Checked once per call rather than
+    pinned to a version, because the worker may be running against whatever a
+    given machine installed.
+    """
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        return name in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        return False
+
+
 def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
                compute_type: str | None = None, batch_size: int = 8,
                source_language: str | None = None, align: bool = True,
@@ -240,11 +257,19 @@ def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
     log(f"{duration / 60:.1f} min of audio")
 
     try:
-        result = model.transcribe(
-            audio, batch_size=batch_size, language=source_language,
-            # Fires per VAD chunk. This is what keeps the worker's stall sweep
-            # from mistaking a long transcription for a dead session.
-            progress_callback=(lambda pct: tick(pct)) if tick else None)
+        # progress_callback fires per VAD chunk, and is what keeps the worker's
+        # stall sweep from mistaking a long transcription for a dead session.
+        # whisperx only grew it in 3.8, so it is offered rather than assumed: on
+        # an older build the call would raise TypeError and lose the whole job
+        # over a progress report. Losing the heartbeat is worth saying out loud
+        # though — without it a long file can be requeued mid-run.
+        kw = {"batch_size": batch_size, "language": source_language}
+        if tick and _accepts(model.transcribe, "progress_callback"):
+            kw["progress_callback"] = lambda pct: tick(pct)
+        elif tick:
+            log("this whisperx has no progress_callback — no heartbeat during "
+                "ASR, so a very long file may be requeued as stalled")
+        result = model.transcribe(audio, **kw)
     finally:
         del model
         free_gpu()
@@ -269,10 +294,10 @@ def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
                 f"keeping Whisper's segment timings")
         else:
             try:
-                aligned = whisperx.align(
-                    segments, amodel, meta, audio, dev,
-                    return_char_alignments=False,
-                    progress_callback=(lambda pct: tick(pct)) if tick else None)
+                akw = {"return_char_alignments": False}
+                if tick and _accepts(whisperx.align, "progress_callback"):
+                    akw["progress_callback"] = lambda pct: tick(pct)
+                aligned = whisperx.align(segments, amodel, meta, audio, dev, **akw)
                 segments = aligned.get("segments") or segments
                 alignment = "word"
                 log("word-level alignment done")
