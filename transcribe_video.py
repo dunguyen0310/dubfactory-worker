@@ -59,6 +59,45 @@ WORD_JUNK_SCORE = 0.2
 # starting a subtitle exactly there reads as late.
 PAD_SECONDS = 0.04
 
+# Whisper speaks ISO 639-1; the app's language picker speaks human names.
+# Handing it "Chinese" fails deep inside model load with "'Chinese' is not a
+# valid language code", after the GPU model is already chosen — so the name is
+# resolved here, at the last boundary before whisperx, and every caller (the
+# app's settings, the CLI, a hand-written job) may use either form.
+LANGUAGE_CODES = {
+    "vietnamese": "vi", "english": "en", "chinese": "zh", "mandarin": "zh",
+    "cantonese": "yue", "japanese": "ja", "korean": "ko", "thai": "th",
+    "indonesian": "id", "french": "fr", "german": "de", "spanish": "es",
+    "portuguese": "pt", "italian": "it", "russian": "ru", "hindi": "hi",
+    "arabic": "ar", "dutch": "nl", "turkish": "tr", "ukrainian": "uk",
+    "polish": "pl", "tagalog": "tl", "filipino": "tl", "malay": "ms",
+    "khmer": "km", "lao": "lo", "burmese": "my",
+}
+
+
+def lang_code(language) -> str | None:
+    """Whatever the caller says the language is, as an ISO code — or None.
+
+    None means detect, and covers "auto" and empty as well, because that is
+    what every caller means by them. An unrecognised NAME is refused here,
+    before any model loads, with a message that says both accepted forms;
+    a short alphabetic token is passed through as a code, so languages beyond
+    the map ("haw", "yue") keep working.
+    """
+    if not language:
+        return None
+    low = str(language).strip().lower()
+    if low in ("auto", "detect", "auto-detect"):
+        return None
+    if low in LANGUAGE_CODES:
+        return LANGUAGE_CODES[low]
+    if 2 <= len(low) <= 3 and low.isascii() and low.isalpha():
+        return low
+    raise ValueError(
+        f"Unknown source language {language!r} — use a name like 'Chinese' "
+        f"or an ISO code like 'zh'.")
+
+
 SENTENCE_END = tuple(".?!…。！？")
 # Whisper writes these languages without spaces, so "words" are characters and
 # joining them with a space would corrupt the text.
@@ -234,6 +273,10 @@ def transcribe(media: str, *, model_name: str = DEFAULT_MODEL, device=None,
     coarse segment boundaries, and every consumer of this — the cue shaper, the
     job's QC summary, whoever reads the .srt — needs to know which it got.
     """
+    # Resolve the language before touching any model: a bad value should cost
+    # nothing, and "Chinese" arriving here is the app working as designed.
+    source_language = lang_code(source_language)
+
     try:
         import whisperx
     except ImportError as e:
@@ -761,7 +804,8 @@ def main():
     p.add_argument("--target", default="Vietnamese",
                    help="language to translate into (default: Vietnamese)")
     p.add_argument("--source", default=None,
-                   help="source language code, e.g. en. Default: detect")
+                   help="spoken language, as a name or ISO code "
+                        "(Chinese or zh). Default: detect")
     p.add_argument("--model", default=DEFAULT_MODEL,
                    help=f"Whisper model (default: {DEFAULT_MODEL})")
     p.add_argument("--device", default=None, help="cuda, cuda:1, cpu")
