@@ -216,6 +216,87 @@ def _():
     assert T.shape_cues([segment([], 1.0, 2.0, text="")], language="en") == []
 
 
+@check("transient provider errors are retried, real ones are not")
+def _():
+    class Boom(Exception):
+        pass
+
+    e503 = Boom("503 UNAVAILABLE high demand")
+    e503b = Boom("x"); e503b.status_code = 503
+    e429 = Boom("Resource has been exhausted (RESOURCE_EXHAUSTED)")
+    bad = ValueError("Expecting value: line 1 column 1")
+    assert T._transient(e503) and T._transient(e503b) and T._transient(e429)
+    assert not T._transient(bad), "a JSON error must fail fast, not retry"
+
+    old = T.RETRY_DELAYS
+    T.RETRY_DELAYS = (0, 0)
+    try:
+        class Flaky:
+            def __init__(self, failures): self.left, self.calls = failures, 0
+            def complete(self, system, prompt):
+                self.calls += 1
+                if self.left:
+                    self.left -= 1
+                    raise Boom("503 UNAVAILABLE")
+                return '{"cues": []}'
+
+        c = Flaky(2)
+        assert T._complete_retry(c, "s", "p", log=lambda m: None) == '{"cues": []}'
+        assert c.calls == 3, f"expected 2 retries then success, got {c.calls} calls"
+
+        c = Flaky(99)
+        try:
+            T._complete_retry(c, "s", "p", log=lambda m: None)
+        except RuntimeError as e:
+            assert "requeue" in str(e), "the failure must say how to recover"
+            assert "transcript is already saved" in str(e)
+        else:
+            raise AssertionError("exhausted retries must raise")
+
+        class Fatal:
+            calls = 0
+            def complete(self, system, prompt):
+                Fatal.calls += 1
+                raise ValueError("bad request")
+        try:
+            T._complete_retry(Fatal(), "s", "p", log=lambda m: None)
+        except ValueError:
+            assert Fatal.calls == 1, "non-transient errors must not be retried"
+        else:
+            raise AssertionError("non-transient error must propagate")
+    finally:
+        T.RETRY_DELAYS = old
+
+
+@check("translate_cues flushes each batch as it lands")
+def _():
+    import json as _json
+    import adapt_srt as A
+
+    class FakeClient:
+        name, model = "fake", "fake-1"
+        def complete(self, system, prompt):
+            idxs = [int(l.split("]")[0][1:]) for l in prompt.splitlines()
+                    if l.startswith("[")]
+            return _json.dumps({"cues": [{"index": i, "text": f"vi{i}"}
+                                         for i in idxs]})
+
+    old_make = A.make_client
+    A.make_client = lambda p, m: FakeClient()
+    try:
+        cues = [{"idx": i, "text": f"line {i}"} for i in range(1, 60)]
+        batches = []
+        out = T.translate_cues(cues, language="Vietnamese",
+                               log=lambda m: None, flush=batches.append)
+        assert len(out) == 59
+        # 59 cues at 25/batch = 3 flushes, in order, disjoint, complete.
+        assert len(batches) == 3, f"expected 3 flushed batches, got {len(batches)}"
+        seen = [i for b in batches for i in b]
+        assert sorted(seen) == list(range(1, 60)), "flushes must cover every cue once"
+    finally:
+        A.make_client = old_make
+
+
 @check("the srt writer round-trips through the pipeline's own parser")
 def _():
     import tempfile
