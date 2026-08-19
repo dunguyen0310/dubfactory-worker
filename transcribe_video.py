@@ -390,14 +390,25 @@ def _words_with_times(segment: dict) -> list[dict]:
         w["end"] = max(float(w["end"]), w["start"])
         cursor = w["end"]
 
-    # Backward pass: a run of unplaced words at the end of a segment would all
-    # sit on the last placed timestamp with zero duration. Spread them over
-    # whatever is left of the segment instead.
-    tail = [w for w in words if w["end"] <= w["start"]]
-    if tail and hi > words[-1]["start"]:
-        span = (hi - words[-1]["start"]) / len(tail)
+    # Two distinct populations of still-zero-duration words, fixed separately
+    # because one formula for both was a bug: a mid-sentence digit was handed
+    # the segment tail's entire remaining span and swallowed the words after it.
+    #
+    # Mid-segment unplaced words occupy the gap they sit in and nothing more:
+    # they end where the next word begins. Only an unplaced run at the very END
+    # of the segment has no next word to borrow from; that run alone is spread
+    # over the segment's remaining time.
+    for i, w in enumerate(words[:-1]):
+        if w["end"] <= w["start"]:
+            w["end"] = max(w["start"], float(words[i + 1]["start"]))
+    tail_start = len(words)
+    while tail_start > 0 and words[tail_start - 1]["end"] <= words[tail_start - 1]["start"]:
+        tail_start -= 1
+    tail = words[tail_start:]
+    if tail and hi > tail[0]["start"]:
+        span = (hi - tail[0]["start"]) / len(tail)
         for n, w in enumerate(tail, 1):
-            w["end"] = w["start"] + span * n
+            w["end"] = tail[0]["start"] + span * n
     return words
 
 
