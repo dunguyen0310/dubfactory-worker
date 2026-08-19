@@ -60,6 +60,14 @@ import soundfile as sf
 
 MASTER_SR = 48000          # video-standard rate the mix is built at
 
+# Wall-clock ceilings for the two external processes. Generous — htdemucs runs
+# many times faster than realtime even on CPU, so a 2-hour episode fits with
+# room to spare — because past these the child is wedged, not slow. Without
+# them a hung Demucs held a job forever while its tick callback renewed the
+# heartbeat, converting the liveness mechanism into a masking mechanism.
+SEPARATE_TIMEOUT_S = 90 * 60
+FFMPEG_TIMEOUT_S = 30 * 60
+
 # Ducking: how fast the bed dives when the dub starts speaking, and how
 # slowly it comes back up in pauses. Values in seconds.
 ATTACK_S = 0.05
@@ -104,7 +112,12 @@ def ffmpeg_exe() -> str:
 
 
 def run(cmd: list[str], what: str):
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=FFMPEG_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise MuxError(f"{what} did not finish in {FFMPEG_TIMEOUT_S // 60} "
+                       f"minutes and was killed — the input is likely corrupt")
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
         raise MuxError(f"{what} failed:\n{tail}")
@@ -147,6 +160,7 @@ def separate_bed(orig_wav: Path, workdir: Path, log=print, tick=None):
     # sit in the poll loop, and a full pipe buffer deadlocks the child.
     demucs_log = workdir / "demucs.log"
     with open(demucs_log, "w", encoding="utf-8", errors="replace") as sink:
+        started = time.time()
         proc = subprocess.Popen(
             [sys.executable, "-m", "demucs", "--two-stems", "vocals",
              "-n", "htdemucs", "-o", str(out), str(orig_wav)],
@@ -155,6 +169,14 @@ def separate_bed(orig_wav: Path, workdir: Path, log=print, tick=None):
             if tick:
                 tick()
             time.sleep(5)
+            if time.time() - started > SEPARATE_TIMEOUT_S:
+                # The tick above keeps the job's heartbeat alive, so a wedged
+                # child would otherwise be held forever with every liveness
+                # check reporting healthy. Kill it and degrade politely.
+                proc.kill()
+                log(f"  Demucs exceeded {SEPARATE_TIMEOUT_S // 60} minutes — "
+                    f"killed; falling back to full-mix ducking")
+                return None
     if proc.returncode != 0:
         text = demucs_log.read_text(encoding="utf-8", errors="replace")
         tail = "\n".join(text.strip().splitlines()[-6:])
