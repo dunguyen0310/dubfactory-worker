@@ -945,7 +945,12 @@ def transcribe_job(sb, job):
             # failed job needs to know. ProviderUnavailable already says it.
             if "transcript" in str(e):
                 raise
-            raise type(e)(
+            # RuntimeError deliberately, not type(e): re-raising the original
+            # type breaks on exceptions whose constructors take more than a
+            # message (json.JSONDecodeError takes three), and the wrapper
+            # TypeError would then mask the real failure. The worker only ever
+            # str()s this into jobs.error anyway.
+            raise RuntimeError(
                 f"{e} — the transcript is saved; requeue this job and only "
                 f"the translation is redone.") from e
 
