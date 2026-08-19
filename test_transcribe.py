@@ -296,6 +296,73 @@ def _():
         T.RETRY_DELAYS = old
 
 
+@check("a busy default model falls back to a pinned older flash")
+def _():
+    import json as _json
+    import adapt_srt as A
+
+    class Busy:
+        name, model = "gemini", "gemini-flash-latest"
+        def complete(self, system, prompt):
+            raise RuntimeError("503 UNAVAILABLE high demand")
+
+    class Works:
+        name, model = "gemini", "gemini-2.5-flash"
+        def complete(self, system, prompt):
+            idxs = [int(l.split("]")[0][1:]) for l in prompt.splitlines()
+                    if l.startswith("[")]
+            return _json.dumps({"cues": [{"index": i, "text": f"vi{i}"}
+                                         for i in idxs]})
+
+    made = []
+    def fake_make(provider, model):
+        made.append((provider, model))
+        return Busy() if len(made) == 1 else Works()
+
+    old_make, old_delays = A.make_client, T.RETRY_DELAYS
+    A.make_client, T.RETRY_DELAYS = fake_make, ()
+    try:
+        logs = []
+        out = T.translate_cues([{"idx": i, "text": f"line {i}"} for i in (1, 2, 3)],
+                               language="Vietnamese", log=logs.append)
+        assert len(out) == 3, f"fallback should finish the job: {out}"
+        # The first fallback tried must be the pinned older flash, not a guess.
+        assert made[1] == ("gemini", "gemini-2.5-flash"), made
+        assert any("switching translation" in l for l in logs), logs
+    finally:
+        A.make_client, T.RETRY_DELAYS = old_make, old_delays
+
+
+@check("a pinned model is never silently replaced")
+def _():
+    import adapt_srt as A
+
+    class Busy:
+        name, model = "gemini", "my-pinned-model"
+        def complete(self, system, prompt):
+            raise RuntimeError("503 UNAVAILABLE high demand")
+
+    made = []
+    def fake_make(provider, model):
+        made.append((provider, model))
+        return Busy()
+
+    old_make, old_delays = A.make_client, T.RETRY_DELAYS
+    A.make_client, T.RETRY_DELAYS = fake_make, ()
+    try:
+        try:
+            T.translate_cues([{"idx": 1, "text": "line"}],
+                             language="Vietnamese", model="my-pinned-model",
+                             log=lambda m: None)
+        except T.ProviderUnavailable:
+            pass
+        else:
+            raise AssertionError("a busy pinned model must fail, not substitute")
+        assert made == [("auto", "my-pinned-model")],             f"pinning must prevent any fallback client: {made}"
+    finally:
+        A.make_client, T.RETRY_DELAYS = old_make, old_delays
+
+
 @check("translate_cues flushes each batch as it lands")
 def _():
     import json as _json
