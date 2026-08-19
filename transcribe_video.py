@@ -602,19 +602,32 @@ def _transient(exc: BaseException) -> bool:
         "timeout", "internal server error", "500 internal"))
 
 
+class ProviderUnavailable(RuntimeError):
+    """Transient failures outlasted every retry.
+
+    Its own type, not a bare RuntimeError, because adapt_srt's BadModel and
+    NoCredentials are RuntimeErrors too and mean the opposite thing: those fail
+    fast and must never trigger a wait-and-retry, while this one is what the
+    model-fallback path listens for.
+    """
+
+
 def _complete_retry(client, system, prompt, *, log=print, tick=None) -> str:
     """client.complete with backoff on transient provider errors.
 
-    Raises the original error immediately when it is not transient, and an
-    actionable RuntimeError when patience runs out — one that says the
-    transcript is safe, because that is the first thing anyone reading the
-    failed job needs to know.
+    Raises the original error immediately when it is not transient, and
+    ProviderUnavailable when patience runs out — with the transcript-is-safe
+    line, because that is the first thing anyone reading the failed job needs
+    to know. Every retry line carries the cause: a per-minute rate limit and an
+    exhausted daily quota both arrive as 429, and only the text tells a reader
+    whether waiting can help at all.
     """
     last = None
     for attempt, delay in enumerate((0,) + RETRY_DELAYS):
         if delay:
             log(f"  provider busy — retrying in {delay}s "
-                f"(attempt {attempt + 1} of {len(RETRY_DELAYS) + 1})")
+                f"(attempt {attempt + 1} of {len(RETRY_DELAYS) + 1}): "
+                f"{_why(last)[:110]}")
             if tick:
                 tick()          # heartbeat through the wait
             time.sleep(delay)
@@ -624,11 +637,14 @@ def _complete_retry(client, system, prompt, *, log=print, tick=None) -> str:
             if not _transient(e):
                 raise
             last = e
-    raise RuntimeError(
-        f"The translation service is unavailable ({_why(last)}) — gave up "
-        f"after {len(RETRY_DELAYS) + 1} attempts. The transcript is already "
-        f"saved, so requeue the job and only the translation is redone."
-    ) from last
+    msg = (f"The translation service is unavailable ({_why(last)}) — gave up "
+           f"after {len(RETRY_DELAYS) + 1} attempts. The transcript is already "
+           f"saved, so requeue the job and only the translation is redone.")
+    if any(m in str(last).lower() for m in ("quota", "resource_exhausted")):
+        msg += (" The error mentions quota: if a daily limit is exhausted, "
+                "retrying today will not help — pin settings.translate_model "
+                "to another model, or add a second provider key.")
+    raise ProviderUnavailable(msg) from last
 
 
 SYSTEM = """You are a professional subtitle translator. You translate \
@@ -691,6 +707,45 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
     log(f"translating {len(items)} line(s) to {language} "
         f"with {client.name}/{client.model}")
 
+    # The active client, switchable mid-run. A pinned model is never
+    # substituted — pinning exists so a job is reproducible, and a silent
+    # different model behind a pin would be worse than the failure.
+    state = {"client": client, "primary": True, "queue": None}
+
+    def _switch(reason):
+        if model:
+            return False
+        if state["queue"] is None:
+            state["queue"] = _fallback_models(state["client"].name, provider)
+        while state["queue"]:
+            prov, mod = state["queue"].pop(0)
+            try:
+                nxt = A.make_client(prov, mod)
+            except Exception as e:
+                log(f"  fallback {prov}/{mod or 'default'} unavailable: "
+                    f"{str(e).strip().splitlines()[0][:90]}")
+                continue
+            state["client"], state["primary"] = nxt, False
+            log(f"  switching translation to {nxt.name}/{nxt.model} — {reason}")
+            return True
+        return False
+
+    def _call(prompt):
+        while True:
+            try:
+                return _complete_retry(state["client"], system, prompt,
+                                       log=log, tick=tick)
+            except ProviderUnavailable:
+                if not _switch("the previous model stayed unavailable"):
+                    raise
+            except (A.BadModel, A.NoCredentials):
+                # From the PRIMARY these are real configuration errors and must
+                # surface. From a fallback candidate they only mean this key
+                # cannot see that model — move down the list.
+                if state["primary"] or not _switch("that model is not "
+                                                   "available to this key"):
+                    raise
+
     by_index = dict(items)
     out: dict[int, str] = {}
     for start in range(0, len(items), BATCH):
@@ -708,8 +763,7 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
 
         prompt = (f"Translate these subtitle cues into {language}.\n\n"
                   + "\n".join(lines))
-        payload = json.loads(_complete_retry(client, system, prompt,
-                                             log=log, tick=tick))
+        payload = json.loads(_call(prompt))
         got = {}
         for row in payload.get("cues") or []:
             idx, text = row.get("index"), str(row.get("text") or "").strip()
@@ -737,8 +791,7 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
                       f"Return all {len(chunk)} of them.\n\n"
                       + "\n".join(f"[{i}] {t}" for i, t in chunk))
             try:
-                payload = json.loads(_complete_retry(client, system, prompt,
-                                                     log=log, tick=tick))
+                payload = json.loads(_call(prompt))
             except Exception as e:
                 # Non-fatal by design: a line that stays untranslated keeps its
                 # transcript text and is counted, which beats failing a job
@@ -761,6 +814,25 @@ def translate_cues(cues, *, language="Vietnamese", provider="auto", model=None,
         log(f"  {len(still)} line(s) left untranslated: {still[:20]}"
             f"{' …' if len(still) > 20 else ''} — they keep the source text")
     return out
+
+
+def _fallback_models(primary_name: str, provider_setting: str):
+    """Where translation goes when the configured model stays unavailable.
+
+    Within Gemini, two pinned generations: the floating -latest alias is the
+    most contended model Google runs (measured: a job held at 503 through every
+    retry), while the previous flash generations usually have capacity — and
+    2.5-flash is the pin this repo's own docs recommend. Crossing to the other
+    provider happens only when the job said "auto": a job that named its
+    provider chose it, and substituting the other one behind that choice would
+    be a different kind of failure.
+    """
+    fb = []
+    if primary_name == "gemini":
+        fb += [("gemini", "gemini-2.5-flash"), ("gemini", "gemini-2.0-flash")]
+    if provider_setting == "auto":
+        fb.append(("anthropic" if primary_name == "gemini" else "gemini", None))
+    return fb
 
 
 def _cue_index(c) -> int:
