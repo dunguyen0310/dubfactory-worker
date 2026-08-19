@@ -206,7 +206,11 @@ def upload_output(sb, path, data: bytes, content_type: str):
 
 
 def has_column(sb, table, column):
-    """Columns from the voice-library migration are optional; degrade politely."""
+    """Columns from the voice-library migration are optional; degrade politely.
+
+    The answer is cached for the session either way — so a migration applied
+    while a worker runs is picked up on the next restart, not mid-session.
+    """
     key = f"{table}.{column}"
     if key not in _COLS:
         try:
@@ -220,6 +224,27 @@ def has_column(sb, table, column):
 
 
 _COLS: dict[str, bool] = {}
+
+
+# ------------------------------------------------------------- scratch space
+
+# Workspaces created for the job currently being processed. Swept after every
+# job in the main loop: a video job's workspace holds the source video, every
+# per-cue wav, the dub and the Demucs stems — routinely gigabytes — and Colab's
+# VM death was the only cleanup. The RunPod/local loop mode runs for days, and
+# four leaked workspaces a day fill a disk in a week.
+_SCRATCH: list[Path] = []
+
+
+def scratch(prefix: str) -> Path:
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    _SCRATCH.append(d)
+    return d
+
+
+def _sweep_scratch():
+    while _SCRATCH:
+        shutil.rmtree(_SCRATCH.pop(), ignore_errors=True)
 
 
 # ----------------------------------------------------------------- presence
@@ -280,9 +305,18 @@ def beat(sb, status, job_id=None, detail=None, force=False):
                       "audio_min": round(_stats["audio_s"] / 60, 1)},
         }).execute()
         _beat["at"] = time.time()
+        _beat["fails"] = 0
     except Exception as e:
-        _beat["on"] = False
-        print(f"  (engine status off — render_workers unavailable: {e})", flush=True)
+        # "Table missing" fails every time and should silence presence for the
+        # session; one dropped request on a worker with hours left should not.
+        # Three consecutive failures tell those apart without a schema probe.
+        _beat["fails"] = _beat.get("fails", 0) + 1
+        if _beat["fails"] >= 3:
+            _beat["on"] = False
+            print(f"  (engine status off — render_workers unavailable: {e})",
+                  flush=True)
+        else:
+            print(f"  (presence write failed, will retry: {e})", flush=True)
 
 
 _touch = {"at": 0.0}
@@ -391,7 +425,7 @@ def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
 def process_voice(sb, voice):
     """QC → transcribe → encode → audition → cache. Runs once per uploaded voice."""
     vid = voice["id"]
-    work = Path(tempfile.mkdtemp(prefix=f"voice_{vid[:8]}_"))
+    work = scratch(f"voice_{vid[:8]}_")
     print(f"\n=== voice {vid} — {voice['name']} ===", flush=True)
     sb.table("voices").update({"status": "encoding", "error": None}).eq("id", vid).execute()
 
@@ -560,7 +594,7 @@ def adapt_cues(sb, job, cues, language, settings):
             syllables_per_sec=syl,
             log=_adapt_log,
             tick=lambda: touch_job(sb, job, detail="adapting over-long lines"))
-    except (A.NoCredentials, A.BadModel) as e:
+    except (A.NoCredentials, A.BadModel, A.ProviderUnavailable) as e:
         # Never fail a render over this: the original text still speaks, it
         # just may overrun. Surface it so staff know why nothing was rewritten.
         log(sb, job, "adapting", f"Skipped — {str(e).splitlines()[0]}")
@@ -627,6 +661,9 @@ def mux_video(sb, job, work, dub_wav):
     out_mp4 = work / "dubbed.mp4"
     info = V.mux_dub(
         str(local_video), str(dub_wav), str(out_mp4),
+        # Inside the job workspace, so the per-job sweep collects the extracted
+        # original audio and the Demucs stems along with everything else.
+        workdir=work / "mux",
         duck_db=settings.get("duck_db"),
         # An absent key means the default blend; an explicit null means the job
         # asked for a pure separated bed, so .get's default cannot be reused.
@@ -712,7 +749,7 @@ def transcribe_job(sb, job):
     if not media_path:
         raise RuntimeError("transcribe job has no media file attached")
 
-    work = Path(tempfile.mkdtemp(prefix=f"tr_{job_id[:8]}_"))
+    work = scratch(f"tr_{job_id[:8]}_")
     set_job(sb, job_id, status="compiling")
     log(sb, job, "compiling", "Preparing to transcribe")
 
@@ -750,8 +787,14 @@ def transcribe_job(sb, job):
 
         set_job(sb, job_id, status="transcribing")
         log(sb, job, "transcribing", f"Fetching {Path(media_path).name}")
+        # The phases before WhisperX's first progress callback — this download,
+        # a cold-cache model fetch, the audio decode — are otherwise silent,
+        # and on a slow link they can cross the 15-minute stall window and get
+        # a LIVE job handed to a second worker. Stamp liveness on the way in.
+        touch_job(sb, job, detail="downloading the source media")
         local = work / ("source" + (Path(media_path).suffix.lower() or ".mp4"))
         local.write_bytes(sb.storage.from_("videos").download(media_path))
+        touch_job(sb, job, detail="loading the ASR model")
 
         def _asr_log(m):
             print(f"  [transcribing] {m}", flush=True)
@@ -851,28 +894,65 @@ def transcribe_job(sb, job):
             """
             nonlocal translated
             stamp = now_iso()
+            payload = []
             for idx, text in batch.items():
                 row = by_idx.get(idx)
                 if row is None:
                     continue
-                sb.table("cues").update({
+                row["source_text"], row["translated_at"] = text, stamp
+                # The full row rides along so the INSERT arm of the upsert's
+                # ON CONFLICT satisfies RLS and the NOT NULL columns; on the
+                # UPDATE arm only these columns are touched.
+                payload.append({
+                    "id": row["id"], "owner_id": row.get("owner_id") or owner,
+                    "job_id": job_id, "idx": row["idx"],
+                    "start_ms": row["start_ms"], "end_ms": row["end_ms"],
+                    "transcript_text": row.get("transcript_text"),
                     "source_text": text, "translated_at": stamp,
                     # A translated line is no longer waiting on anything; keep
                     # the review flag only where the transcription was doubtful.
                     "status": row.get("status") or "pending",
-                }).eq("id", row["id"]).execute()
-                row["source_text"], row["translated_at"] = text, stamp
+                })
                 translated += 1
+            if payload:
+                try:
+                    # One round trip per flushed batch, not one per cue — a
+                    # 600-cue episode was 600 sequential updates from Colab.
+                    sb.table("cues").upsert(payload).execute()
+                except Exception as e:
+                    print(f"  (batch write failed, falling back per-row: {e})",
+                          flush=True)
+                    for p in payload:
+                        sb.table("cues").update({
+                            "source_text": p["source_text"],
+                            "translated_at": p["translated_at"],
+                            "status": p["status"],
+                        }).eq("id", p["id"]).execute()
             set_job_progress(sb, job_id, done_cues=done_before + translated)
 
-        T.translate_cues(
-            probes, language=target,
-            provider=settings.get("translate_provider",
-                                  settings.get("adapt_provider", "auto")),
-            model=settings.get("translate_model"),
-            log=_tr_log,
-            tick=lambda: touch_job(sb, job, detail="translating"),
-            flush=persist)
+        try:
+            T.translate_cues(
+                probes, language=target,
+                provider=settings.get("translate_provider",
+                                      settings.get("adapt_provider", "auto")),
+                model=settings.get("translate_model"),
+                log=_tr_log,
+                tick=lambda: touch_job(sb, job, detail="translating"),
+                flush=persist)
+        except Exception as e:
+            # Whatever broke translation — no key, bad model, outage — the ASR
+            # is committed, and that is the first thing anyone reading the
+            # failed job needs to know. ProviderUnavailable already says it.
+            if "transcript" in str(e):
+                raise
+            # RuntimeError deliberately, not type(e): re-raising the original
+            # type breaks on exceptions whose constructors take more than a
+            # message (json.JSONDecodeError takes three), and the wrapper
+            # TypeError would then mask the real failure. The worker only ever
+            # str()s this into jobs.error anyway.
+            raise RuntimeError(
+                f"{e} — the transcript is saved; requeue this job and only "
+                f"the translation is redone.") from e
 
     untranslated = len(rows) - done_before - translated
     if untranslated:
@@ -889,7 +969,11 @@ def transcribe_job(sb, job):
                 for r in sorted(rows, key=lambda r: r["idx"])]
     srt_out = work / "transcript.vi.srt"
     T.write_srt(cues_out, srt_out)
-    out_path = f"{owner}/{job_id}/transcript.{target[:2].lower()}.srt"
+    try:
+        target_code = T.lang_code(target) or target[:2].lower()
+    except ValueError:
+        target_code = target[:2].lower()
+    out_path = f"{owner}/{job_id}/transcript.{target_code}.srt"
     upload_output(sb, out_path, srt_out.read_bytes(), "application/x-subrip")
 
     review = sum(1 for r in rows if r.get("status") == "review")
@@ -938,7 +1022,7 @@ def render_job(sb, job):
         read_captions = True
         timing_mode = "natural"
 
-    work = Path(tempfile.mkdtemp(prefix=f"job_{job_id[:8]}_"))
+    work = scratch(f"job_{job_id[:8]}_")
     set_job(sb, job_id, status="compiling")
     log(sb, job, "compiling", "Reading cues")
 
@@ -1384,6 +1468,7 @@ def main():
                     traceback.print_exc()
                     sb.table("voices").update({"status": "failed", "error": str(e)[:500]}) \
                         .eq("id", voice["id"]).execute()
+                _sweep_scratch()
                 continue
 
             job = claim_next_job(sb)
@@ -1407,6 +1492,7 @@ def main():
                     set_job(sb, job["id"], status="failed", error=str(e)[:500])
                     log(sb, job, "failed", str(e)[:300])
                 print_stats(t0)
+                _sweep_scratch()
                 continue
 
             if args.once:
@@ -1420,6 +1506,7 @@ def main():
     except KeyboardInterrupt:
         print("\nstopped by hand", flush=True)
     finally:
+        _sweep_scratch()
         # Say goodbye rather than letting the row go stale: the indicator in the
         # web app then flips to "off" the moment the Colab cell ends, instead of
         # a minute later.

@@ -83,8 +83,21 @@ class Query:
             self.db.log.append((self.table, "insert", len(new)))
             return Result(new)
         if self.op == "upsert":
-            rows.append(dict(self.payload))
-            return Result([self.payload])
+            new = self.payload if isinstance(self.payload, list) else [self.payload]
+            for r in new:
+                r = dict(r)
+                cur = (next((x for x in rows if x.get("id") == r.get("id")), None)
+                       if r.get("id") is not None else None)
+                if cur is not None:
+                    # PostgREST merges provided columns on conflict; columns
+                    # not in the payload keep their existing values.
+                    cur.update(r)
+                else:
+                    for col in COLUMN_DEFAULTS.get(self.table, ()):
+                        r.setdefault(col, None)
+                    rows.append(r)
+            self.db.log.append((self.table, "upsert", len(new)))
+            return Result(new)
         if self.op == "update":
             hit = [r for r in rows if self._match(r)]
             for r in hit:
@@ -374,6 +387,39 @@ def _():
         assert "media" in str(e).lower(), e
     else:
         raise AssertionError(f"should have raised, ran {calls}")
+
+
+@check("a translation crash of any exception type reports the recovery fact")
+def _():
+    import json as _json
+
+    db = make_db()
+    job = new_job(db)
+
+    monkey, calls = [], {}
+    install_stubs(monkey, calls=calls)
+    # JSONDecodeError's constructor takes three arguments — the exact shape
+    # that broke a naive type(e)(msg) re-raise and masked the real failure.
+    def bad_json(cues, **kw):
+        raise _json.JSONDecodeError("Expecting value", "doc", 0)
+    T.translate_cues = bad_json
+    W._COLS.clear()
+    W._beat.update(at=0.0, on=False)
+    W._touch["at"] = 0.0
+    try:
+        W.transcribe_job(db, job)
+    except RuntimeError as e:
+        assert "transcript is saved" in str(e), e
+        assert "Expecting value" in str(e), e
+    else:
+        raise AssertionError("a translation crash must surface")
+    finally:
+        for obj, attr, orig in monkey:
+            setattr(obj, attr, orig)
+    # The expensive half survived the crash: transcript rows and the source
+    # .srt are already committed, which is what the message promises.
+    assert db.tables["cues"], "cues must be committed before translation"
+    assert any(p.endswith("transcript.src.srt") for p in db.uploads), db.uploads
 
 
 @check("untranslated lines are reported and keep their transcript")

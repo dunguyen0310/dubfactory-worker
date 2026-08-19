@@ -138,6 +138,22 @@ def _():
     assert "2026" in text and "Zalo" in text, f"dropped a word: {text}"
 
 
+@check("a mid-segment unplaced word cannot swallow the segment tail")
+def _():
+    # A(0-1), B unplaced, C(2-3), D unplaced, segment end 10. The old backward
+    # pass gave B end = start + (10-3)/2 = 4.5, overlapping C entirely. B must
+    # end where C begins; only the trailing run (D) may spread to segment end.
+    seg = segment([
+        ("A", 0.0, 1.0), ("B", None, None),
+        ("C", 2.0, 3.0), ("D", None, None),
+    ], start=0.0, end=10.0)
+    ws = T._words_with_times(seg)
+    assert ws[1]["end"] <= ws[2]["start"] + 1e-6, f"B swallowed the tail: {ws[1]}"
+    assert ws[3]["start"] < ws[3]["end"] <= 10.0 + 1e-6, ws[3]
+    cues = T.shape_cues([seg], language="en")
+    assert_sane(cues, "mid-unplaced")
+
+
 @check("a segment with no words at all is kept whole")
 def _():
     # Alignment failed for this line: no words, but the transcript is there.

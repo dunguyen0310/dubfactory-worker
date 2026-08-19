@@ -86,9 +86,12 @@ def parse_srt(path: str) -> list[Cue]:
         raw = " ".join(lines[text_start:]).strip()
         text = TAG_RE.sub("", raw).strip()
         if text and end > start:
-            cues.append(Cue(len(cues) + 1, start, end, text, raw))
+            cues.append(Cue(0, start, end, text, raw))
     cues.sort(key=lambda c: c.start)
-    return cues
+    # Indices assigned AFTER the sort: on a file whose blocks are out of
+    # order, numbering first left .index unordered against time.
+    return [Cue(n, c.start, c.end, c.text, c.raw)
+            for n, c in enumerate(cues, 1)]
 
 
 def fmt_ts(t: float) -> str:
