@@ -80,6 +80,17 @@ SILENT_BED_DBFS = -50.0
 BED_DEFICIT_DB = 20.0
 
 
+class MuxError(RuntimeError):
+    """A step of the mux failed.
+
+    Raised instead of sys.exit, because this module is a library as well as a
+    CLI: sys.exit raises SystemExit, which is a BaseException and not an
+    Exception, so it sailed straight through the worker's `except Exception`
+    guards and killed the whole worker process over one bad container. Library
+    callers catch this; the CLI turns it into an exit code in main().
+    """
+
+
 def die(msg: str):
     sys.exit(f"error: {msg}")
 
@@ -87,8 +98,8 @@ def die(msg: str):
 def ffmpeg_exe() -> str:
     exe = shutil.which("ffmpeg")
     if not exe:
-        die("ffmpeg not found on PATH. Install it (winget install Gyan.FFmpeg) "
-            "and reopen the terminal.")
+        raise MuxError("ffmpeg not found on PATH. Install it "
+                       "(winget install Gyan.FFmpeg) and reopen the terminal.")
     return exe
 
 
@@ -96,7 +107,7 @@ def run(cmd: list[str], what: str):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
-        die(f"{what} failed:\n{tail}")
+        raise MuxError(f"{what} failed:\n{tail}")
     return proc
 
 
@@ -396,7 +407,7 @@ def main():
                 separate=not args.no_separate,
                 residual_db=None if args.no_residual else args.residual_db,
                 keep_audio=args.keep_audio)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, MuxError) as e:
         die(str(e))
     print(f"\nwrote {args.output}")
 
