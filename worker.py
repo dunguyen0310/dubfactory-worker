@@ -206,7 +206,11 @@ def upload_output(sb, path, data: bytes, content_type: str):
 
 
 def has_column(sb, table, column):
-    """Columns from the voice-library migration are optional; degrade politely."""
+    """Columns from the voice-library migration are optional; degrade politely.
+
+    The answer is cached for the session either way — so a migration applied
+    while a worker runs is picked up on the next restart, not mid-session.
+    """
     key = f"{table}.{column}"
     if key not in _COLS:
         try:
@@ -301,9 +305,18 @@ def beat(sb, status, job_id=None, detail=None, force=False):
                       "audio_min": round(_stats["audio_s"] / 60, 1)},
         }).execute()
         _beat["at"] = time.time()
+        _beat["fails"] = 0
     except Exception as e:
-        _beat["on"] = False
-        print(f"  (engine status off — render_workers unavailable: {e})", flush=True)
+        # "Table missing" fails every time and should silence presence for the
+        # session; one dropped request on a worker with hours left should not.
+        # Three consecutive failures tell those apart without a schema probe.
+        _beat["fails"] = _beat.get("fails", 0) + 1
+        if _beat["fails"] >= 3:
+            _beat["on"] = False
+            print(f"  (engine status off — render_workers unavailable: {e})",
+                  flush=True)
+        else:
+            print(f"  (presence write failed, will retry: {e})", flush=True)
 
 
 _touch = {"at": 0.0}
@@ -774,8 +787,14 @@ def transcribe_job(sb, job):
 
         set_job(sb, job_id, status="transcribing")
         log(sb, job, "transcribing", f"Fetching {Path(media_path).name}")
+        # The phases before WhisperX's first progress callback — this download,
+        # a cold-cache model fetch, the audio decode — are otherwise silent,
+        # and on a slow link they can cross the 15-minute stall window and get
+        # a LIVE job handed to a second worker. Stamp liveness on the way in.
+        touch_job(sb, job, detail="downloading the source media")
         local = work / ("source" + (Path(media_path).suffix.lower() or ".mp4"))
         local.write_bytes(sb.storage.from_("videos").download(media_path))
+        touch_job(sb, job, detail="loading the ASR model")
 
         def _asr_log(m):
             print(f"  [transcribing] {m}", flush=True)
@@ -875,28 +894,60 @@ def transcribe_job(sb, job):
             """
             nonlocal translated
             stamp = now_iso()
+            payload = []
             for idx, text in batch.items():
                 row = by_idx.get(idx)
                 if row is None:
                     continue
-                sb.table("cues").update({
+                row["source_text"], row["translated_at"] = text, stamp
+                # The full row rides along so the INSERT arm of the upsert's
+                # ON CONFLICT satisfies RLS and the NOT NULL columns; on the
+                # UPDATE arm only these columns are touched.
+                payload.append({
+                    "id": row["id"], "owner_id": row.get("owner_id") or owner,
+                    "job_id": job_id, "idx": row["idx"],
+                    "start_ms": row["start_ms"], "end_ms": row["end_ms"],
+                    "transcript_text": row.get("transcript_text"),
                     "source_text": text, "translated_at": stamp,
                     # A translated line is no longer waiting on anything; keep
                     # the review flag only where the transcription was doubtful.
                     "status": row.get("status") or "pending",
-                }).eq("id", row["id"]).execute()
-                row["source_text"], row["translated_at"] = text, stamp
+                })
                 translated += 1
+            if payload:
+                try:
+                    # One round trip per flushed batch, not one per cue — a
+                    # 600-cue episode was 600 sequential updates from Colab.
+                    sb.table("cues").upsert(payload).execute()
+                except Exception as e:
+                    print(f"  (batch write failed, falling back per-row: {e})",
+                          flush=True)
+                    for p in payload:
+                        sb.table("cues").update({
+                            "source_text": p["source_text"],
+                            "translated_at": p["translated_at"],
+                            "status": p["status"],
+                        }).eq("id", p["id"]).execute()
             set_job_progress(sb, job_id, done_cues=done_before + translated)
 
-        T.translate_cues(
-            probes, language=target,
-            provider=settings.get("translate_provider",
-                                  settings.get("adapt_provider", "auto")),
-            model=settings.get("translate_model"),
-            log=_tr_log,
-            tick=lambda: touch_job(sb, job, detail="translating"),
-            flush=persist)
+        try:
+            T.translate_cues(
+                probes, language=target,
+                provider=settings.get("translate_provider",
+                                      settings.get("adapt_provider", "auto")),
+                model=settings.get("translate_model"),
+                log=_tr_log,
+                tick=lambda: touch_job(sb, job, detail="translating"),
+                flush=persist)
+        except Exception as e:
+            # Whatever broke translation — no key, bad model, outage — the ASR
+            # is committed, and that is the first thing anyone reading the
+            # failed job needs to know. ProviderUnavailable already says it.
+            if "transcript" in str(e):
+                raise
+            raise type(e)(
+                f"{e} — the transcript is saved; requeue this job and only "
+                f"the translation is redone.") from e
 
     untranslated = len(rows) - done_before - translated
     if untranslated:
@@ -913,7 +964,11 @@ def transcribe_job(sb, job):
                 for r in sorted(rows, key=lambda r: r["idx"])]
     srt_out = work / "transcript.vi.srt"
     T.write_srt(cues_out, srt_out)
-    out_path = f"{owner}/{job_id}/transcript.{target[:2].lower()}.srt"
+    try:
+        target_code = T.lang_code(target) or target[:2].lower()
+    except ValueError:
+        target_code = target[:2].lower()
+    out_path = f"{owner}/{job_id}/transcript.{target_code}.srt"
     upload_output(sb, out_path, srt_out.read_bytes(), "application/x-subrip")
 
     review = sum(1 for r in rows if r.get("status") == "review")

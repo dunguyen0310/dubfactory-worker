@@ -83,8 +83,21 @@ class Query:
             self.db.log.append((self.table, "insert", len(new)))
             return Result(new)
         if self.op == "upsert":
-            rows.append(dict(self.payload))
-            return Result([self.payload])
+            new = self.payload if isinstance(self.payload, list) else [self.payload]
+            for r in new:
+                r = dict(r)
+                cur = (next((x for x in rows if x.get("id") == r.get("id")), None)
+                       if r.get("id") is not None else None)
+                if cur is not None:
+                    # PostgREST merges provided columns on conflict; columns
+                    # not in the payload keep their existing values.
+                    cur.update(r)
+                else:
+                    for col in COLUMN_DEFAULTS.get(self.table, ()):
+                        r.setdefault(col, None)
+                    rows.append(r)
+            self.db.log.append((self.table, "upsert", len(new)))
+            return Result(new)
         if self.op == "update":
             hit = [r for r in rows if self._match(r)]
             for r in hit:

@@ -99,7 +99,16 @@ def analyse_sample(path: str) -> dict:
 
     spec = np.abs(librosa.stft(y[: SR * 20], n_fft=2048)).mean(axis=1)
     freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
-    bandwidth = float(freqs[np.searchsorted(np.cumsum(spec) / spec.sum(), 0.99)])
+    total = float(spec.sum())
+    if total <= 1e-9:
+        # Silence has no bandwidth. Say so in words, not in NaN: NaN is not
+        # valid JSON, so it used to surface downstream as a serialization
+        # error on the voices row instead of the actual problem.
+        return {"duration_s": round(dur, 2), "peak": round(peak, 3),
+                "snr_db": 0.0, "bandwidth_hz": 0,
+                "pitch_median_hz": None, "pitch_shift_hz": None,
+                "warnings": ["recording is silent — re-export or re-record"]}
+    bandwidth = float(freqs[np.searchsorted(np.cumsum(spec) / total, 0.99)])
 
     pitch_median = pitch_shift = None
     if dur >= 1.0:
