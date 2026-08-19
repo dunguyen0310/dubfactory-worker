@@ -594,7 +594,7 @@ def adapt_cues(sb, job, cues, language, settings):
             syllables_per_sec=syl,
             log=_adapt_log,
             tick=lambda: touch_job(sb, job, detail="adapting over-long lines"))
-    except (A.NoCredentials, A.BadModel) as e:
+    except (A.NoCredentials, A.BadModel, A.ProviderUnavailable) as e:
         # Never fail a render over this: the original text still speaks, it
         # just may overrun. Surface it so staff know why nothing was rewritten.
         log(sb, job, "adapting", f"Skipped — {str(e).splitlines()[0]}")

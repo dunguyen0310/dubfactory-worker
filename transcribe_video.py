@@ -35,6 +35,7 @@ import sys
 import time
 from pathlib import Path
 
+import adapt_srt as _prov
 import srt_dub as S
 
 # Subtitle shaping defaults. Two lines of 42 characters is the long-standing
@@ -586,76 +587,29 @@ def _finalise(cues: list[dict], min_seconds: float) -> list[dict]:
 
 # ---------------------------------------------------------------- translation
 
-# Waits between attempts when the translation provider returns a transient
-# error. Gemini's 503 "high demand" failed a whole job once, after the GPU work
-# was already done; "spikes in demand are usually temporary" is Google's own
-# wording, so a couple of minutes of patience is the difference between a
-# finished job and a requeue.
-RETRY_DELAYS = (5, 15, 45, 90)
-
-
-def _transient(exc: BaseException) -> bool:
-    """Whether an API failure is worth retrying.
-
-    Overload, rate limiting and gateway errors pass; everything else — bad
-    JSON, refused batches, revoked keys — fails fast, because retrying those
-    just delays the real error. Checked by status attribute first, then by the
-    strings the two SDKs actually put in their messages.
-    """
-    for attr in ("status_code", "code", "status"):
-        v = getattr(exc, attr, None)
-        if isinstance(v, int) and v in (429, 500, 502, 503, 504):
-            return True
-    text = f"{type(exc).__name__} {exc}".lower()
-    return any(m in text for m in (
-        "503", "unavailable", "overloaded", "high demand", "429",
-        "resource_exhausted", "rate limit", "502", "504", "timed out",
-        "timeout", "internal server error", "500 internal"))
-
-
-class ProviderUnavailable(RuntimeError):
-    """Transient failures outlasted every retry.
-
-    Its own type, not a bare RuntimeError, because adapt_srt's BadModel and
-    NoCredentials are RuntimeErrors too and mean the opposite thing: those fail
-    fast and must never trigger a wait-and-retry, while this one is what the
-    model-fallback path listens for.
-    """
+# The retry/backoff machinery lives in adapt_srt now, shared with adaptation —
+# resilience added at only the newest call site was how a Gemini incident that
+# translation survived still disabled adaptation. Re-exported here because this
+# module's tests and callers address them as transcribe_video.*; RETRY_DELAYS
+# stays a module global so tests can shrink the waits.
+RETRY_DELAYS = _prov.RETRY_DELAYS
+ProviderUnavailable = _prov.ProviderUnavailable
+_transient = _prov._transient
 
 
 def _complete_retry(client, system, prompt, *, log=print, tick=None) -> str:
-    """client.complete with backoff on transient provider errors.
-
-    Raises the original error immediately when it is not transient, and
-    ProviderUnavailable when patience runs out — with the transcript-is-safe
-    line, because that is the first thing anyone reading the failed job needs
-    to know. Every retry line carries the cause: a per-minute rate limit and an
-    exhausted daily quota both arrive as 429, and only the text tells a reader
-    whether waiting can help at all.
+    """The shared retry helper, plus the one fact every translation failure
+    must carry: the transcript is committed, so a requeue redoes only this
+    stage. Adaptation's failures do not say this, because it is not true there.
     """
-    last = None
-    for attempt, delay in enumerate((0,) + RETRY_DELAYS):
-        if delay:
-            log(f"  provider busy — retrying in {delay}s "
-                f"(attempt {attempt + 1} of {len(RETRY_DELAYS) + 1}): "
-                f"{_why(last)[:110]}")
-            if tick:
-                tick()          # heartbeat through the wait
-            time.sleep(delay)
-        try:
-            return client.complete(system, prompt)
-        except Exception as e:
-            if not _transient(e):
-                raise
-            last = e
-    msg = (f"The translation service is unavailable ({_why(last)}) — gave up "
-           f"after {len(RETRY_DELAYS) + 1} attempts. The transcript is already "
-           f"saved, so requeue the job and only the translation is redone.")
-    if any(m in str(last).lower() for m in ("quota", "resource_exhausted")):
-        msg += (" The error mentions quota: if a daily limit is exhausted, "
-                "retrying today will not help — pin settings.translate_model "
-                "to another model, or add a second provider key.")
-    raise ProviderUnavailable(msg) from last
+    try:
+        return _prov.complete_with_retries(client, system, prompt,
+                                           delays=RETRY_DELAYS,
+                                           log=log, tick=tick)
+    except _prov.ProviderUnavailable as e:
+        raise ProviderUnavailable(
+            f"{e} The transcript is already saved, so requeue the job and "
+            f"only the translation is redone.") from e.__cause__
 
 
 SYSTEM = """You are a professional subtitle translator. You translate \
