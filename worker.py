@@ -222,6 +222,27 @@ def has_column(sb, table, column):
 _COLS: dict[str, bool] = {}
 
 
+# ------------------------------------------------------------- scratch space
+
+# Workspaces created for the job currently being processed. Swept after every
+# job in the main loop: a video job's workspace holds the source video, every
+# per-cue wav, the dub and the Demucs stems — routinely gigabytes — and Colab's
+# VM death was the only cleanup. The RunPod/local loop mode runs for days, and
+# four leaked workspaces a day fill a disk in a week.
+_SCRATCH: list[Path] = []
+
+
+def scratch(prefix: str) -> Path:
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    _SCRATCH.append(d)
+    return d
+
+
+def _sweep_scratch():
+    while _SCRATCH:
+        shutil.rmtree(_SCRATCH.pop(), ignore_errors=True)
+
+
 # ----------------------------------------------------------------- presence
 
 # The web app answers "is the render engine on?" from these rows. It has to keep
@@ -391,7 +412,7 @@ def transcribe_many(model, clips: list[np.ndarray]) -> list[str]:
 def process_voice(sb, voice):
     """QC → transcribe → encode → audition → cache. Runs once per uploaded voice."""
     vid = voice["id"]
-    work = Path(tempfile.mkdtemp(prefix=f"voice_{vid[:8]}_"))
+    work = scratch(f"voice_{vid[:8]}_")
     print(f"\n=== voice {vid} — {voice['name']} ===", flush=True)
     sb.table("voices").update({"status": "encoding", "error": None}).eq("id", vid).execute()
 
@@ -627,6 +648,9 @@ def mux_video(sb, job, work, dub_wav):
     out_mp4 = work / "dubbed.mp4"
     info = V.mux_dub(
         str(local_video), str(dub_wav), str(out_mp4),
+        # Inside the job workspace, so the per-job sweep collects the extracted
+        # original audio and the Demucs stems along with everything else.
+        workdir=work / "mux",
         duck_db=settings.get("duck_db"),
         # An absent key means the default blend; an explicit null means the job
         # asked for a pure separated bed, so .get's default cannot be reused.
@@ -712,7 +736,7 @@ def transcribe_job(sb, job):
     if not media_path:
         raise RuntimeError("transcribe job has no media file attached")
 
-    work = Path(tempfile.mkdtemp(prefix=f"tr_{job_id[:8]}_"))
+    work = scratch(f"tr_{job_id[:8]}_")
     set_job(sb, job_id, status="compiling")
     log(sb, job, "compiling", "Preparing to transcribe")
 
@@ -938,7 +962,7 @@ def render_job(sb, job):
         read_captions = True
         timing_mode = "natural"
 
-    work = Path(tempfile.mkdtemp(prefix=f"job_{job_id[:8]}_"))
+    work = scratch(f"job_{job_id[:8]}_")
     set_job(sb, job_id, status="compiling")
     log(sb, job, "compiling", "Reading cues")
 
@@ -1384,6 +1408,7 @@ def main():
                     traceback.print_exc()
                     sb.table("voices").update({"status": "failed", "error": str(e)[:500]}) \
                         .eq("id", voice["id"]).execute()
+                _sweep_scratch()
                 continue
 
             job = claim_next_job(sb)
@@ -1407,6 +1432,7 @@ def main():
                     set_job(sb, job["id"], status="failed", error=str(e)[:500])
                     log(sb, job, "failed", str(e)[:300])
                 print_stats(t0)
+                _sweep_scratch()
                 continue
 
             if args.once:
@@ -1420,6 +1446,7 @@ def main():
     except KeyboardInterrupt:
         print("\nstopped by hand", flush=True)
     finally:
+        _sweep_scratch()
         # Say goodbye rather than letting the row go stale: the indicator in the
         # web app then flips to "off" the moment the Colab cell ends, instead of
         # a minute later.

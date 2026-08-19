@@ -259,7 +259,8 @@ def normalize_dub(dub: np.ndarray) -> np.ndarray:
 def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
             bed_gain_db: float = 0.0, separate: bool = True,
             residual_db: float | None = RESIDUAL_DB,
-            keep_audio: str | None = None, log=print, tick=None) -> dict:
+            keep_audio: str | None = None, log=print, tick=None,
+            workdir: "Path | str | None" = None) -> dict:
     """Lay `dub` over `video`'s music/effects bed and write `output`.
 
     `residual_db` is how much of the separated vocals stem goes back into the
@@ -274,7 +275,14 @@ def mux_dub(video: str, dub: str, output: str, *, duck_db: float | None = None,
     if not Path(dub).exists():
         raise FileNotFoundError(f"dub not found: {dub}")
 
-    work = Path(tempfile.mkdtemp(prefix="videodub_"))
+    if workdir is not None:
+        # The worker hands in a directory inside its job workspace, which its
+        # per-job sweep removes; this function then owns no cleanup at all.
+        work = Path(workdir)
+        work.mkdir(parents=True, exist_ok=True)
+    else:
+        # CLI path: the process exits right after, so OS temp is the cleanup.
+        work = Path(tempfile.mkdtemp(prefix="videodub_"))
 
     # ---- original audio --------------------------------------------------
     orig_wav = work / "original.wav"
