@@ -13,6 +13,14 @@ browser ──▶ Supabase ◀── worker (here)
             queue         claims → renders → writes back
 ```
 
+> **There is a second worker in this repo.** `vieneu_worker.py` drains a
+> separate queue with a different model (VieNeu-TTS v3 Turbo) for the web app's
+> **Studio** tab — 48 kHz, twenty built-in Vietnamese voices, instant cloning,
+> and **no GPU required**. It shares nothing with this one but the Supabase
+> project. See [VIENEU_SETUP.md](VIENEU_SETUP.md), and install it in its own
+> virtualenv: it pins `transformers==4.57.6` and omnivoice wants a much newer
+> one.
+
 ## Install
 
 ```bash
@@ -207,6 +215,7 @@ are both stubbed:
 ```bash
 python test_transcribe.py          # cue shaping: 14 checks
 python test_worker_transcribe.py   # transcribe_job orchestration: 7 checks
+python test_vieneu_worker.py       # the studio worker: 38 checks
 ```
 
 Cue shaping is where the edge cases actually live, and all three of these came
