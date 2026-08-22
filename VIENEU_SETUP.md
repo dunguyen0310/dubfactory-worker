@@ -51,9 +51,20 @@ pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.
 pip install "transformers==4.57.6" vieneu supabase
 ```
 
-> Install VieNeu in **its own environment**, not the one holding OmniVoice. It
-> pins `transformers==4.57.6` and omnivoice wants a much newer one; putting them
-> in one venv means whichever was installed last works and the other does not.
+> Install VieNeu in **its own environment**, not the one holding OmniVoice.
+>
+> The CPU build is torch-free and pulls no `transformers` at all — verified on
+> 3.3.0: `onnxruntime`, and neither package anywhere in site-packages. What it
+> *does* bring is its own `tokenizers`, `huggingface_hub`, `numba`, `librosa`
+> and `gradio`, which is very nearly the exact set the dub stack's install is
+> most delicate about (see the comments in the Colab notebook's install cell for
+> what that delicacy cost to find). Dropping five more pinned packages into that
+> resolution and hoping pip reconciles them is a poor trade against 750 MB of
+> disk and two minutes.
+>
+> The **GPU** build is a harder no: it pins `transformers==4.57.6` and omnivoice
+> needs `>=5.3`, so those two genuinely cannot share an environment at all.
+>
 > Two virtualenvs, two processes, no shared dependency — which is the same
 > reason the tables are separate.
 
