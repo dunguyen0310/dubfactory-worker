@@ -14,7 +14,7 @@ stop an episode.
 | Model | OmniVoice, 600+ languages | VieNeu-TTS v3 Turbo, Vietnamese + English |
 | Sample rate | 24 kHz | **48 kHz** |
 | Hardware | **needs an NVIDIA GPU** | **CPU is fine** — ONNX, torch-free |
-| Voices | cloned or designed, all built by a worker | **20 built-in presets** + instant cloning |
+| Voices | cloned or designed, all built by a worker | **23 built-in presets** (20 before vieneu 3.6.4) + instant cloning |
 | Input | subtitles, video, documents | typed text |
 | Timecode | cues must fit their slots | none — nothing to fit |
 | Tables | `jobs`, `cues`, `voices`, `render_workers` | `vieneu_jobs`, `vieneu_lines`, `vieneu_voices`, `vieneu_workers` |
@@ -51,9 +51,20 @@ pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.
 pip install "transformers==4.57.6" vieneu supabase
 ```
 
-> Install VieNeu in **its own environment**, not the one holding OmniVoice. It
-> pins `transformers==4.57.6` and omnivoice wants a much newer one; putting them
-> in one venv means whichever was installed last works and the other does not.
+> Install VieNeu in **its own environment**, not the one holding OmniVoice.
+>
+> The CPU build is torch-free and pulls no `transformers` at all — verified on
+> 3.3.0: `onnxruntime`, and neither package anywhere in site-packages. What it
+> *does* bring is its own `tokenizers`, `huggingface_hub`, `numba`, `librosa`
+> and `gradio`, which is very nearly the exact set the dub stack's install is
+> most delicate about (see the comments in the Colab notebook's install cell for
+> what that delicacy cost to find). Dropping five more pinned packages into that
+> resolution and hoping pip reconciles them is a poor trade against 750 MB of
+> disk and two minutes.
+>
+> The **GPU** build is a harder no: it pins `transformers==4.57.6` and omnivoice
+> needs `>=5.3`, so those two genuinely cannot share an environment at all.
+>
 > Two virtualenvs, two processes, no shared dependency — which is the same
 > reason the tables are separate.
 
@@ -100,6 +111,38 @@ Asking for `pytorch` on a machine with no CUDA **falls back to ONNX** rather
 than failing every job, and the presence row records what it actually ended up
 running — so the app shows the truth rather than the request.
 
+### Verified against vieneu 3.6.4 (September 2026)
+
+The signatures the worker calls — `Vieneu()`, `infer`, `infer_batch`,
+`add_voice(denoise=…)`, `denoise`, `list_preset_voices`, `save` — are unchanged
+from 3.3.0. The only additions are a `babble_retries=2` constructor knob and a
+`mode="v3nano"` variant: a 48M-parameter model at 24 kHz, roughly 3× faster and
+noticeably worse on English and code-switched text. The worker does not use it;
+the Studio is sold on 48 kHz.
+
+Measured on an i9-10900K (Comet Lake, no VNNI), so this is the pessimistic
+case for int8:
+
+| precision | model load | speed | note |
+|---|---|---|---|
+| `int8` (default) | 8 s | **3.2× realtime** | still faster without VNNI |
+| `fp32` | 22 s | 2.0× realtime | for a final master, if ever |
+
+### Running it on a Windows machine
+
+```powershell
+py -3.13 -m venv .venv-vieneu          # 3.10–3.13; the 3.14 launcher default is too new
+.\.venv-vieneu\Scripts\pip.exe install vieneu supabase soundfile numpy
+.\.venv-vieneu\Scripts\python.exe vieneu_worker.py --list-voices   # downloads ~1 GB once
+```
+
+Two Windows-only notes. Hugging Face warns that the cache "uses symlinks by
+default" and your machine "does not support them"; the cache still works, it
+just duplicates a file or two. Enabling Developer Mode in Settings silences it.
+And the worker widens stdout to UTF-8 on start-up because a Windows console is
+cp1252 by default and every preset is named in Vietnamese — the first version
+died printing a voice name, after the render had already finished.
+
 ## The three job kinds
 
 | `kind` | In | Out |
@@ -116,10 +159,12 @@ re-rendering the other ninety.
 
 ## Voices
 
-Twenty presets ship **inside the model**, addressed by name (`Adam`,
-`Xuân Vĩnh`). They are not rows in any table: copying them into one would
-create a second source of truth that goes stale the moment the model ships a
-voice 21. `vieneu_jobs.voice_preset` holds the name, and the worker checks it
+The presets ship **inside the model**, addressed by name (`Adam`, `Xuân
+Vĩnh`). They are not rows in any table: copying them into one would create a
+second source of truth that goes stale the moment the model ships a new voice —
+which it did: vieneu 3.6.4 went from 20 to 23 (`Mạnh Dũng`, `Minh Quân`, `Anh
+Khôi`, all northern and male) and moved its default from `Adam` to `Minh Quân`.
+Nothing here needed changing for that; the worker asks the model. `vieneu_jobs.voice_preset` holds the name, and the worker checks it
 against `Vieneu.list_preset_voices()` — an unknown name fails the job **saying
 what the model does know**, rather than quietly falling back to a default.
 
