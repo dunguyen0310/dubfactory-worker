@@ -5,6 +5,9 @@ Two queues, drained in one loop:
   2. jobs   with status='queued'    -> render, verify, assemble, upload
                                        or, for kind='transcribe',
                                        transcribe, translate, upload .srt
+                                       or, for kind='hardsub',
+                                       OCR the burned-in subtitles, translate
+                                       (DeepSeek), upload .srt
 
 Progress is written back to the tables the UI already subscribes to, so the
 frontend updates live with no changes.
@@ -32,6 +35,7 @@ Other environment:
     WORKER_POLL_SECONDS          idle poll interval (default 5)
     WORKER_ID                    presence row id (default: hostname-pid)
     WORKER_LABEL                 name shown in the web app (default: Colab / RunPod / hostname)
+    DEEPSEEK_API_KEY             translation for hardsub jobs (the OCR runs without it)
 
 Run:
     python worker.py                       # loop until stopped
@@ -41,6 +45,7 @@ Run:
 
 import argparse
 import io
+import logging
 import os
 import platform
 import re
@@ -1003,6 +1008,426 @@ def transcribe_job(sb, job):
         + (f", {review} to check" if review else ""), qc)
 
 
+# ------------------------------------------------------------------ hardsub
+
+# What the worker calls each rapidocr language key when it names the source
+# language on the job, and which two-letter code the translator's prompt uses.
+HARDSUB_LANGS = {
+    "ch": ("Chinese", "zh"),            # the default model reads Chinese and English
+    "zh-tw": ("Chinese (Traditional)", "zh"),
+    "en": ("English", "en"),
+    "ko": ("Korean", "ko"),
+    "ja": ("Japanese", "ja"),
+}
+
+
+def _hardsub_crop(value):
+    """`settings.crop` is "x,y,w,h" in percent, or empty for auto-detect."""
+    if value in (None, "", "auto"):
+        return None
+    if isinstance(value, (list, tuple)) and len(value) == 4:
+        return tuple(float(v) for v in value)
+    parts = [p.strip() for p in str(value).split(",")]
+    if len(parts) != 4:
+        raise RuntimeError(f"scan band must be x,y,w,h in percent, got {value!r}")
+    return tuple(float(p) for p in parts)
+
+
+def _ocr_on_gpu():
+    """Only claim the GPU when ONNX Runtime can actually use it.
+
+    rapidocr falls back to CPU with nothing but a warning when the CUDA provider
+    is missing, and an OCR pass that silently runs 10x slower on a GPU box is
+    the failure nobody notices for an hour. Decided once here and said out loud
+    in the job log.
+    """
+    if not DEVICE.startswith("cuda"):
+        return False
+    try:
+        import onnxruntime as ort
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls(cuda=True, cudnn=True)
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+def hardsub_job(sb, job):
+    """Burned-in subtitles in, translated subtitles out.
+
+    The third way a job can start life, beside "speak this .srt" and
+    "transcribe this speech": a video whose subtitles are already in the
+    picture. Speech-to-text guesses at where a line starts and ends; text
+    burned into the frame has exact on-screen timing, so this reads it back
+    instead — hardsub_ocr.py, the headless port of Subtitle Edit's Video OCR —
+    and then translates it with the DeepSeek API.
+
+    Deliberately the same shape as transcribe_job, down to the columns: the
+    OCR text lands in `cues.transcript_text`, the translation in
+    `cues.source_text`, the two .srt files under the same names, and the job
+    walks `transcribing -> translating` (the OCR pass is "transcribing" to the
+    rest of the app — same tone, same stall sweep, same board lane). That is
+    what lets the Transcript panel, the review table and "Dub this transcript"
+    work on a hardsub job with no special cases anywhere in them.
+
+    The two halves resume independently for the same reason as transcribe_job:
+    the OCR costs minutes of GPU and needs a video, the translation costs cents
+    and needs DEEPSEEK_API_KEY. A job requeued because the key was missing must
+    not read the video again, so the cues are committed and the source .srt
+    uploaded before the API is ever called.
+    """
+    import hardsub_ocr as H
+    import translate_srt_deepseek as D
+
+    # Both modules report through `logging`, which the worker never configures;
+    # their per-stage lines (frames sampled, groups, models, timings) are the
+    # console record of an OCR pass, so route them to stdout like everything else.
+    for name in ("hardsub", "translate"):
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            h = logging.StreamHandler(sys.stdout)
+            h.setFormatter(logging.Formatter(f"  [{name}] %(message)s"))
+            lg.addHandler(h)
+            lg.setLevel(logging.INFO)
+
+    job_id, owner = job["id"], job["owner_id"]
+    settings = job.get("settings") or {}
+    target = settings.get("language", "Vietnamese")
+    ocr_lang = str(settings.get("ocr_lang") or "ch").lower()
+    if ocr_lang not in HARDSUB_LANGS:
+        raise RuntimeError(
+            f"unsupported subtitle language {ocr_lang!r} — one of "
+            + ", ".join(HARDSUB_LANGS))
+    source_name, source_code = HARDSUB_LANGS[ocr_lang]
+    # Han ideographs are what the junk filter keys on; Korean and English
+    # lines have none and must not be dropped for it.
+    cjk_source = ocr_lang in ("ch", "zh-tw", "ja")
+    min_conf = float(settings.get("min_confidence", 0.9) or 0)
+    do_translate = settings.get("translate", True) is not False
+    crop = _hardsub_crop(settings.get("crop"))
+
+    require_columns(sb, job, ("cues", "transcript_text"),
+                    ("cues", "translated_at"), ("jobs", "transcript_src_path"))
+
+    media_path = job.get("video_path")
+    if not media_path:
+        raise RuntimeError("hardsub job has no video attached")
+
+    work = scratch(f"hs_{job_id[:8]}_")
+    set_job(sb, job_id, status="compiling")
+    log(sb, job, "compiling", "Preparing to read the burned-in subtitles")
+
+    rows = (sb.table("cues").select("*").eq("job_id", job_id)
+            .order("idx").execute().data) or []
+    expected = job.get("total_cues") or 0
+    complete = bool(rows) and len(rows) == expected and all(
+        (r.get("transcript_text") or "").strip() for r in rows)
+
+    prior = (job.get("qc_summary") or {}) if complete else {}
+    qc_base = {k: prior[k] for k in ("scan_area_pct", "audio_seconds", "cues_read",
+                                     "cues_dropped", "low_confidence",
+                                     "static_text_removed", "ocr_seconds",
+                                     "scan_preview_path", "ocr_json_path")
+               if k in prior}
+
+    if complete:
+        log(sb, job, "transcribing",
+            f"Reusing the {len(rows)} lines read on the previous attempt — "
+            f"only the translation is redone")
+    else:
+        if rows:
+            # Cue timing comes from one pass over the whole video; a second
+            # pass would group the frames differently and the halves would not
+            # line up. Start clean, as transcribe_job does.
+            log(sb, job, "transcribing",
+                f"Discarding {len(rows)} cue(s) from an interrupted read")
+            sb.table("cues").delete().eq("job_id", job_id).execute()
+
+        set_job(sb, job_id, status="transcribing")
+        log(sb, job, "transcribing", f"Fetching {Path(media_path).name}")
+        touch_job(sb, job, detail="downloading the source video")
+        local = work / ("source" + (Path(media_path).suffix.lower() or ".mp4"))
+        local.write_bytes(sb.storage.from_("videos").download(media_path))
+
+        gpu = _ocr_on_gpu()
+        log(sb, job, "transcribing",
+            f"Reading {source_name} subtitles on the "
+            + ("GPU" if gpu else "CPU")
+            + (f", scan band {','.join(str(round(c, 1)) for c in crop)} %"
+               if crop else ", scan band found automatically"))
+        touch_job(sb, job, detail="loading the OCR models")
+
+        _stage = {"ocr": "reading the subtitles", "refine": "refining the timing"}
+
+        def _progress(stage, n, m):
+            touch_job(sb, job, detail=f"{_stage.get(stage, stage)} — {n}/{m}")
+
+        previews = work / "previews"
+        try:
+            result = H.run(
+                str(local), str(work / "ocr.srt"),
+                lang=ocr_lang, crop=crop, auto_crop=crop is None,
+                scan_preview=str(previews), work_dir=str(work / "frames"),
+                brightness_min=int(settings.get("brightness_min", H.DEFAULTS["brightness_min"])),
+                ignore_text=list(settings.get("ignore_text") or []) or None,
+                side_text=bool(settings.get("keep_side_text")),
+                gpu=gpu, write_json=True, progress=_progress)
+        except SystemExit as e:
+            # hardsub_ocr is a CLI first and exits on a bad option; in here that
+            # would take the whole worker down with it.
+            raise RuntimeError(str(e)) from e
+
+        lines = result.get("lines") or []
+        if not lines:
+            raise RuntimeError(
+                "no burned-in subtitles found in this video — check the scan "
+                "band preview and the brightness setting, or the video has none")
+
+        # The junk filter from translate_srt_deepseek, applied before the lines
+        # become cues rather than after: a licence plate that reaches the cues
+        # table gets spoken by the dub. Every decision is written to the job
+        # log so a dropped line can always be found and the filter loosened.
+        cues_in = [D.Cue(int(ln["index"]), H.fmt_ts(ln["start_ms"]), H.fmt_ts(ln["end_ms"]),
+                         ln["text"], float(ln.get("confidence", 1.0)))
+                   for ln in lines]
+        confidences = {c.index: c.confidence for c in cues_in}
+        by_index = {int(ln["index"]): ln for ln in lines}
+        if min_conf > 0 or cjk_source:
+            kept, dropped = D.clean_cues(cues_in, confidences, min_confidence=min_conf,
+                                         cjk_source=cjk_source)
+        else:
+            kept, dropped = cues_in, []
+        if dropped:
+            # clean_cues strips the junk out of c.text as it goes, so the log
+            # quotes the line as it was read, from the OCR result.
+            log(sb, job, "transcribing",
+                f"Dropped {len(dropped)} line(s) that read as scene text or noise",
+                {"dropped": [{"index": c.index, "start": c.start,
+                              "text": by_index[c.index]["text"],
+                              "confidence": round(c.confidence or 0, 2),
+                              "why": "; ".join(c.notes)} for c in dropped[:60]]})
+        if not kept:
+            raise RuntimeError(
+                f"all {len(lines)} lines read from this video were filtered as "
+                f"junk — lower the confidence threshold or check the scan band")
+
+        duration = round(float(result.get("duration_s") or 0.0), 2)
+        timings = result.get("timings") or {}
+        low = sum(1 for c in kept if (c.confidence or 1.0) < 0.8)
+        qc_base = {
+            "scan_area_pct": result.get("scan_area_pct"),
+            "audio_seconds": duration,
+            "cues_read": len(lines),
+            "cues_dropped": len(dropped),
+            "low_confidence": low,
+            "static_text_removed": result.get("static_text_removed") or [],
+            "ocr_seconds": timings.get("total_s"),
+        }
+        log(sb, job, "transcribing",
+            f"Read {len(kept)} line(s) of {source_name} in {timings.get('total_s', 0):.0f}s"
+            + (f", {low} low-confidence" if low else ""),
+            {"timings": timings, "scan_area_pct": result.get("scan_area_pct"),
+             "models": (result.get("settings") or {}).get("models")})
+
+        # total_cues before the rows, so an interrupted insert is detectable.
+        set_job(sb, job_id, total_cues=len(kept), done_cues=0,
+                qc_summary={"kind": "hardsub", "source_language": source_name,
+                            "target_language": target, "cues_total": len(kept), **qc_base})
+        payload = []
+        for i, c in enumerate(kept, 1):
+            ln = by_index[c.index]
+            doubtful = (c.confidence or 1.0) < 0.8
+            note = None
+            if doubtful:
+                note = f"low OCR confidence ({c.confidence:.2f}) — check this line"
+            elif c.notes:
+                note = "; ".join(c.notes)
+            payload.append({
+                "owner_id": owner, "job_id": job_id, "idx": i,
+                "start_ms": int(round(ln["start_ms"])), "end_ms": int(round(ln["end_ms"])),
+                # source_text is what gets spoken; until the translation lands
+                # the honest value is the line as read, never blank.
+                "source_text": c.text, "transcript_text": c.text,
+                "status": "review" if (doubtful or c.notes) else "pending",
+                "note": note,
+            })
+        for i in range(0, len(payload), 500):
+            sb.table("cues").insert(payload[i:i + 500]).execute()
+
+        # The source .srt is uploaded before translation is attempted, so a
+        # missing API key costs the translation and nothing else. The OCR
+        # sidecar and the scan-band preview ride along for review: the preview
+        # is how you tell a wrong scan band from a video with no subtitles.
+        srt_src = work / "transcript.src.srt"
+        D.write_srt(kept, {}, srt_src)
+        src_path = f"{owner}/{job_id}/transcript.src.srt"
+        upload_output(sb, src_path, srt_src.read_bytes(), "application/x-subrip")
+        set_job(sb, job_id, transcript_src_path=src_path)
+        try:
+            side = (work / "ocr.srt").with_suffix(".ocr.json")
+            if side.exists():
+                p = f"{owner}/{job_id}/transcript.ocr.json"
+                upload_output(sb, p, side.read_bytes(), "application/json")
+                qc_base["ocr_json_path"] = p
+            png = next(iter(sorted(previews.glob("*.png"))), None) if previews.exists() else None
+            if png is not None:
+                p = f"{owner}/{job_id}/scan_preview.png"
+                upload_output(sb, p, png.read_bytes(), "image/png")
+                qc_base["scan_preview_path"] = p
+        except Exception as e:
+            print(f"  (review extras not uploaded: {e})", flush=True)
+        set_job_progress(sb, job_id,
+                         qc_summary={"kind": "hardsub", "source_language": source_name,
+                                     "target_language": target, "cues_total": len(kept),
+                                     **qc_base})
+        log(sb, job, "transcribing", "Source-language subtitles saved")
+
+        rows = (sb.table("cues").select("*").eq("job_id", job_id)
+                .order("idx").execute().data)
+
+    # ---------------------------------------------------------- translate
+    refresh_auth(sb)
+    translated = 0
+    pending = [r for r in rows if not r.get("translated_at")]
+    done_before = len(rows) - len(pending)
+    glossary = settings.get("glossary") if isinstance(settings.get("glossary"), dict) else {}
+
+    if not do_translate:
+        log(sb, job, "translating", "Translation switched off for this job — "
+            "delivering the subtitles as read")
+        pending = []
+    elif pending:
+        set_job(sb, job_id, status="translating")
+        if done_before:
+            log(sb, job, "translating",
+                f"{done_before} line(s) were already translated — translating "
+                f"the remaining {len(pending)}")
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "DEEPSEEK_API_KEY is not set on this worker — the subtitles are "
+                "saved; set the key, requeue this job and only the translation "
+                "is redone.")
+        model = settings.get("translate_model") or D.DEFAULT_MODEL
+        client = D.DeepSeek(api_key, model=model)
+        by_idx = {r["idx"]: r for r in pending}
+        cues = [D.Cue(r["idx"], H.fmt_ts(r["start_ms"]), H.fmt_ts(r["end_ms"]),
+                      r.get("transcript_text") or r["source_text"])
+                for r in pending]
+
+        def persist(batch):
+            """Write one chunk of translations the moment it exists — the
+            same reasoning as transcribe_job's persist: minutes of API calls
+            can die halfway, and a requeue must only redo what is missing."""
+            nonlocal translated
+            stamp = now_iso()
+            payload = []
+            for idx, text in batch.items():
+                row = by_idx.get(idx)
+                if row is None:
+                    continue
+                row["source_text"], row["translated_at"] = text, stamp
+                payload.append({
+                    "id": row["id"], "owner_id": row.get("owner_id") or owner,
+                    "job_id": job_id, "idx": row["idx"],
+                    "start_ms": row["start_ms"], "end_ms": row["end_ms"],
+                    "transcript_text": row.get("transcript_text"),
+                    "source_text": text, "translated_at": stamp,
+                    "status": row.get("status") or "pending",
+                })
+                translated += 1
+            if payload:
+                try:
+                    sb.table("cues").upsert(payload).execute()
+                except Exception as e:
+                    print(f"  (batch write failed, falling back per-row: {e})",
+                          flush=True)
+                    for p in payload:
+                        sb.table("cues").update({
+                            "source_text": p["source_text"],
+                            "translated_at": p["translated_at"],
+                            "status": p["status"],
+                        }).eq("id", p["id"]).execute()
+            set_job_progress(sb, job_id, done_cues=done_before + translated)
+            touch_job(sb, job, detail=f"translating — {done_before + translated}/{len(rows)}")
+
+        try:
+            if not glossary and settings.get("build_glossary", True) is not False:
+                # Names first, so 曼云 is Mạn Vân in every line of the episode
+                # rather than whatever each chunk decided. Kept on the job so
+                # the next episode of the series can be given the same list.
+                touch_job(sb, job, detail="building the glossary")
+                glossary = D.glossary_from_lines(
+                    [r.get("transcript_text") or r["source_text"] for r in rows],
+                    client, source=source_code)
+                log(sb, job, "translating",
+                    f"Glossary: {len(glossary)} name(s) and term(s) fixed for the episode",
+                    {"glossary": glossary})
+            log(sb, job, "translating",
+                f"Translating {len(pending)} line(s) into {target} with {model}")
+            _, failed = D.translate_cues(
+                cues, client, language=target, source=source_code,
+                glossary=glossary, style=str(settings.get("style") or ""),
+                chunk=int(settings.get("translate_chunk", 60)),
+                log_prefix=f"{job.get('title') or job_id[:8]}: ", flush=persist)
+            if failed:
+                log(sb, job, "translating",
+                    f"{len(failed)} line(s) came back missing after retries",
+                    {"indices": failed[:50]})
+            qc_base["translate_tokens"] = dict(client.usage)
+        except Exception as e:
+            if "subtitles are saved" in str(e):
+                raise
+            raise RuntimeError(
+                f"{e} — the subtitles are saved; requeue this job and only "
+                f"the translation is redone.") from e
+
+    untranslated = len(rows) - done_before - translated
+    if untranslated and do_translate:
+        log(sb, job, "translating",
+            f"{untranslated} line(s) could not be translated and keep their "
+            f"original wording")
+
+    # ------------------------------------------------------------- deliver
+    refresh_auth(sb, force=True)
+    ordered = sorted(rows, key=lambda r: r["idx"])
+    cues_out = [D.Cue(r["idx"], H.fmt_ts(r["start_ms"]), H.fmt_ts(r["end_ms"]), r["source_text"])
+                for r in ordered]
+    target_code = D.lang_suffix(target) if do_translate else source_code
+    srt_out = work / f"transcript.{target_code}.srt"
+    D.write_srt(cues_out, {}, srt_out)
+    out_path = f"{owner}/{job_id}/transcript.{target_code}.srt"
+    upload_output(sb, out_path, srt_out.read_bytes(), "application/x-subrip")
+
+    review = sum(1 for r in rows if r.get("status") == "review")
+    qc = {
+        "kind": "hardsub",
+        "source_language": source_name,
+        "target_language": target if do_translate else source_name,
+        "alignment": "frame",
+        "cues_total": len(rows),
+        "cues_translated": done_before + translated,
+        "cues_untranslated": untranslated if do_translate else 0,
+        "cues_needing_review": review,
+        "srt_seconds": round(max((r["end_ms"] for r in rows), default=0) / 1000, 2),
+        **qc_base,
+    }
+    if glossary:
+        qc["glossary"] = glossary
+    fields = {"status": "done", "error": None, "srt_out_path": out_path,
+              "done_cues": done_before + translated if do_translate else len(rows),
+              "review_cues": review, "qc_summary": qc}
+    try:
+        set_job(sb, job_id, **fields)
+    except Exception:
+        refresh_auth(sb, force=True)
+        set_job(sb, job_id, **fields)
+    _stats["jobs"] += 1
+    log(sb, job, "done",
+        f"{len(rows)} subtitle line(s) in {qc['target_language']}"
+        + (f", {review} to check" if review else ""), qc)
+
+
 def render_job(sb, job):
     job_id, owner = job["id"], job["owner_id"]
     settings = job.get("settings") or {}
@@ -1478,12 +1903,16 @@ def main():
                 beat(sb, "busy", job_id=job["id"], detail=job["title"], force=True)
                 jt = time.time()
                 try:
-                    # Two different jobs share the queue: one turns subtitles
-                    # into speech, the other turns speech into subtitles. The
-                    # claim, the heartbeat, the presence row and the failure
-                    # handling are identical, so only the middle differs.
-                    if (job.get("kind") or "subtitles") == "transcribe":
+                    # Three different jobs share the queue: one turns subtitles
+                    # into speech, the others turn speech — or text burned into
+                    # the picture — into subtitles. The claim, the heartbeat,
+                    # the presence row and the failure handling are identical,
+                    # so only the middle differs.
+                    kind = job.get("kind") or "subtitles"
+                    if kind == "transcribe":
                         transcribe_job(sb, job)
+                    elif kind == "hardsub":
+                        hardsub_job(sb, job)
                     else:
                         render_job(sb, job)
                     print(f"=== done in {time.time()-jt:.0f}s ===", flush=True)

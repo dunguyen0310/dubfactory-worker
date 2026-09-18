@@ -51,6 +51,19 @@ own constraints; resolving them together is what stops a second install swapping
 out the torch build the first one needed. Its VAD weights ship inside the wheel,
 so no Hugging Face token is involved.
 
+`hardsub` jobs — burned-in subtitles read back off the picture — need the OCR
+stack and a recent ffmpeg. Install `onnxruntime-gpu` *instead of* `onnxruntime`
+(they share an import name; both at once means whichever loads first wins):
+
+```bash
+pip install rapidocr rapidfuzz opencv-python-headless openai onnxruntime-gpu
+```
+
+`hardsub_ocr.py` needs **ffmpeg ≥ 5.1** for `-fps_mode`; on older builds it
+falls back to `-vsync passthrough` by itself, so Colab's ffmpeg 4.4 works. The
+OCR models ship inside the `rapidocr` wheel (PP-OCRv6 small), so nothing is
+downloaded at run time for the default Chinese + English models.
+
 `[tn]` is text normalisation. It needs `pynini`, which has no Windows wheels but
 installs fine on Linux — without it, numbers are read as digits rather than
 words ("thứ 8" comes out as "thứ tư").
@@ -87,7 +100,12 @@ original text rather than failing:
 
 ```bash
 export GEMINI_API_KEY="AIza..."         # or ANTHROPIC_API_KEY
+export DEEPSEEK_API_KEY="sk-..."        # translation on hardsub jobs
 ```
+
+A `hardsub` job without `DEEPSEEK_API_KEY` still reads and saves the source
+subtitles, then fails at the translation step with a message saying so;
+requeueing it after setting the key redoes only the translation.
 
 ```bash
 python worker.py                        # loop until stopped
@@ -119,7 +137,7 @@ small cards the extra 0.06x is not worth the OOM risk.
 
 | Column | Meaning |
 |---|---|
-| `jobs.status` | `compiling → rendering → qc → assembling → done`, or `compiling → transcribing → translating → done` for a transcribe job |
+| `jobs.status` | `compiling → rendering → qc → assembling → done`, or `compiling → transcribing → translating → done` for a transcribe or hardsub job |
 | `jobs.qc_summary` | coverage %, cue counts, timing mode, overrun seconds |
 | `render_workers` | presence: is this worker alive, and what is it doing |
 | `jobs.srt_out_path` | corrected `.srt` matching the generated audio |
@@ -159,6 +177,7 @@ before.
 | `video` | a video and its `.srt` | `dubbed.mp4` |
 | `tts` | typed or uploaded text | audio |
 | `transcribe` | a video or audio file | a translated `.srt` + the source transcript |
+| `hardsub` | a video with subtitles burned into the picture | a translated `.srt` + the subtitles as read, frame-accurate |
 
 A `transcribe` job runs the pipeline backwards — it *produces* the subtitle file
 the other kinds consume — and walks its own two stages,
@@ -181,6 +200,40 @@ This kind does **not** degrade politely when its migration is missing. A job wit
 nowhere to put a transcript is refused by name up front, rather than discovered
 one dropped column at a time after an hour of GPU time.
 
+A `hardsub` job is the transcribe job for footage that already carries its
+subtitles in the picture. Speech-to-text guesses at where a line starts and
+ends; text burned into the frame has exact on-screen timing, so the worker reads
+it back instead — `hardsub_ocr.py`, a headless port of Subtitle Edit's Video
+OCR (RapidOCR / PaddleOCR models on ONNX Runtime, frame grouping, watermark
+removal, boundary refinement at the native frame rate) — and translates the
+result with the DeepSeek API (`translate_srt_deepseek.py`). It walks the same
+two stages, writes the same columns (`cues.transcript_text` for the line as
+read, `cues.source_text` for the translation) and uploads the same pair of
+files, so the Transcript panel and "Dub this transcript" work on it unchanged.
+Three things are its own:
+
+- **Scene text is filtered before it becomes a cue.** A licence plate or a
+  logo inside the scan band reads like a subtitle, at low confidence and with
+  no Chinese character in it. Lines under `settings.min_confidence` (0.9) and,
+  for Chinese/Japanese sources, lines without a Han character are dropped,
+  each one logged to `job_events` with the reason. `min_confidence: 0` keeps
+  everything and flags the doubtful lines for review instead.
+- **A glossary pass first**, so a character's name is rendered the same way in
+  every line. The list is saved in `qc_summary.glossary`; pass it back as
+  `settings.glossary` on the next episode of the series to keep it stable.
+- **Review extras**: the OCR sidecar (`transcript.ocr.json`, per-cue
+  confidence and timings) and a frame with the scan band drawn on it
+  (`scan_preview.png`) are uploaded beside the subtitles. The preview is how
+  you tell a wrong scan band from a video that has no subtitles.
+
+`settings` it reads: `language` (target, default Vietnamese), `ocr_lang`
+(`ch` = Chinese + English, `en`, `ko`, `ja`, `zh-tw`), `crop` (`x,y,w,h` in
+percent, or empty to find the band automatically), `brightness_min` (190),
+`min_confidence` (0.9), `ignore_text` (regexes), `keep_side_text`,
+`translate` (false = deliver the subtitles as read), `translate_model`
+(`deepseek-flash`, or `deepseek-v4-pro`), `style`, `glossary`,
+`build_glossary` (default true).
+
 A `tts` job is prose, not subtitles, so two subtitle conventions are switched
 off for it — one of which loses text. Caption skipping would silently drop a
 paragraph that happens to be wholly parenthesised, and `(See appendix A.)` is
@@ -199,12 +252,16 @@ Each runs standalone as well as inside the worker, which is how they are tested.
 | `video_dub.py` | Lays the dub over the source video, keeping the music and effects and ducking them under the new voice. |
 | `srt_dub.py` | The original one-shot CLI: subtitles plus a reference clip in, dub out. |
 | `transcribe_video.py` | The reverse direction: WhisperX transcribes a video, forced alignment puts a timestamp on every *word*, those words are cut into subtitle-shaped cues, and the same provider layer `adapt_srt.py` uses translates them. `--dry-run` transcribes with no API key. |
+| `hardsub_ocr.py` | Burned-in subtitles back out of the picture: samples the scan band, groups near-identical frames, OCRs one frame per group, removes watermarks, merges runs into cues and refines every boundary at the native frame rate. Standalone: `python hardsub_ocr.py ep.mp4 --lang ch`. |
+| `translate_srt_deepseek.py` | `.srt` in, `.vi.srt` out via the DeepSeek API, cleaning OCR junk first. `--dry-run` shows the cleaning decisions with no API key. |
 
 ```bash
 python speakers.py episode.srt --show-lines
 python adapt_srt.py --srt episode.srt --dry-run
 python video_dub.py --video ep.mp4 --dub dub.wav --output ep_vn.mp4
 python transcribe_video.py --video ep.mp4 --output ep_vi.srt
+python hardsub_ocr.py ep.mp4 -o ep.srt --lang ch
+python translate_srt_deepseek.py ep.srt --dry-run
 ```
 
 ## Tests
@@ -214,7 +271,8 @@ are both stubbed:
 
 ```bash
 python test_transcribe.py          # cue shaping: 14 checks
-python test_worker_transcribe.py   # transcribe_job orchestration: 7 checks
+python test_worker_transcribe.py   # transcribe_job orchestration: 8 checks
+python test_worker_hardsub.py      # hardsub_job orchestration: 15 checks
 python test_vieneu_worker.py       # the studio worker: 38 checks
 ```
 
@@ -231,5 +289,6 @@ out of writing those tests rather than out of review:
   numerals and foreign names do it constantly. They still have to be spoken, so
   they take the timing of whatever surrounds them rather than being dropped.
 
-The orchestration tests run `transcribe_job` against a fake Supabase, and the
-property they exist to hold is that a requeued job never pays for ASR twice.
+The orchestration tests run `transcribe_job` and `hardsub_job` against a fake
+Supabase, and the property they exist to hold is that a requeued job never pays
+for the ASR — or the OCR — twice.
