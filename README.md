@@ -15,11 +15,12 @@ browser ──▶ Supabase ◀── worker (here)
 
 > **There is a second worker in this repo.** `vieneu_worker.py` drains a
 > separate queue with a different model (VieNeu-TTS v3 Turbo) for the web app's
-> **Studio** tab — 48 kHz, twenty built-in Vietnamese voices, instant cloning,
+> **Studio** tab — 48 kHz, 23 built-in Vietnamese voices, instant cloning,
 > and **no GPU required**. It shares nothing with this one but the Supabase
 > project. See [VIENEU_SETUP.md](VIENEU_SETUP.md), and install it in its own
-> virtualenv: it pins `transformers==4.57.6` and omnivoice wants a much newer
-> one.
+> virtualenv — it carries its own pins of the packages this stack is fussiest
+> about, and its GPU build pins `transformers==4.57.6` where omnivoice needs
+> `>=5.3`.
 
 ## Install
 
