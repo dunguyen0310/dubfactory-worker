@@ -36,6 +36,9 @@ pip install google-genai      # or `anthropic` — rewrites over-long lines,
                               #   and translates transcribe jobs
 pip install demucs            # removes the original voices from a video
 apt-get install -y ffmpeg     # required for video jobs at all
+pip install jieba opencc-python-reimplemented
+                              # Chinese transcribe jobs: cues never cut inside
+                              #   a word, Traditional folded to Simplified
 ```
 
 `transcribe` jobs are the one kind with a hard dependency — without WhisperX
@@ -196,6 +199,60 @@ translation. `cues.translated_at` is what makes that exact — a line that is on
 a name or a number legitimately translates to itself, so "has it been
 translated?" cannot be inferred by comparing the two columns.
 
+### Subtitle accuracy
+
+A transcript is only useful as subtitles if each line is on screen while it is
+spoken, and short enough to read in that time. Three things decide that:
+
+**Where cues are cut.** `shape_cues` sizes cues for the script they are written
+in — a Chinese cue is one 16-character line, a Latin-script one two lines of 42
+— because a cue's real job is to carry its translation, and a Hanzi carries
+about five Latin characters of meaning. Within that, it cuts where a subtitler
+would: sentence ends first, then clause marks and the phrase breaks Whisper
+writes as spaces in unpunctuated Chinese, then real pauses; never inside a word
+(jieba finds Chinese word boundaries). Every possible cutting of a stretch of
+speech is scored and the cheapest wins, and a silence of a second always ends a
+cue. Mandarin is transcribed with a short punctuated Simplified style prompt,
+because punctuation is the best evidence of where a line ends and the aligner
+only knows Simplified characters.
+
+**When cues appear.** A cue comes up 0.1 s before its first word and stays
+0.35 s after its last, taking that time only from silence; it lasts at least a
+second where the silence allows; a gap under half a second to the next line
+closes to two frames, so dialogue does not flicker. If the audio track starts
+later than the picture, every time is moved onto the video's timeline.
+
+**How long translations are.** Each cue reaches the translator with its
+duration and a character budget — reading speed times duration, 17 characters
+a second for Vietnamese — and a line that comes back well over it gets one
+condensing pass. The delivered `.srt` breaks lines over one display line in
+two, at punctuation or before a conjunction; the database keeps them whole.
+
+Job settings, all optional:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `asr_prompt` | `auto` | Whisper style prompt: `auto` (by language), `off`, or your own text — a series' character names improve how they are heard |
+| `isolate_vocals` | `false` | transcribe Demucs' vocals stem instead of the full mix (music-heavy footage) |
+| `max_cue_chars` / `max_cue_seconds` | by script | override the cue size limits |
+| `max_cps` | by target language | reading speed the translation is held to |
+
+Each job also saves `transcript.words.json` — the word-level ASR result — so its
+cues can be re-cut later without the GPU (`transcribe_video.py --from-words`),
+and its QC summary carries the shape of what was delivered (median and longest
+cue, lines over their reading budget, cues with estimated timing).
+
+**Measuring it.** A video with burned-in subtitles is its own answer key: run it
+as a `hardsub` job, and score the transcribe job's source transcript against
+the OCR output.
+
+```bash
+python eval_subtitles.py --ref transcript.ocr.srt --hyp transcript.src.srt
+```
+
+It reports how early or late each reference line's text appears and leaves the
+screen, how alike the two files are cut, and the character error rate.
+
 This kind does **not** degrade politely when its migration is missing. A job with
 nowhere to put a transcript is refused by name up front, rather than discovered
 one dropped column at a time after an hour of GPU time.
@@ -251,7 +308,8 @@ Each runs standalone as well as inside the worker, which is how they are tested.
 | `adapt_srt.py` | Rewrites lines with more syllables than their slot can hold — the root cause of both dropped words and rushed audio. `--dry-run` reports the fit with no API key at all. |
 | `video_dub.py` | Lays the dub over the source video, keeping the music and effects and ducking them under the new voice. |
 | `srt_dub.py` | The original one-shot CLI: subtitles plus a reference clip in, dub out. |
-| `transcribe_video.py` | The reverse direction: WhisperX transcribes a video, forced alignment puts a timestamp on every *word*, those words are cut into subtitle-shaped cues, and the same provider layer `adapt_srt.py` uses translates them. `--dry-run` transcribes with no API key. |
+| `transcribe_video.py` | The reverse direction: WhisperX transcribes a video, forced alignment puts a timestamp on every *word*, those words are cut into subtitle-shaped cues sized for their script, and the same provider layer `adapt_srt.py` uses translates them within a reading-speed budget. `--dry-run` transcribes with no API key; `--from-words` re-cuts a saved transcript without the GPU. |
+| `eval_subtitles.py` | Scores one `.srt` against another — ideally a transcript against the burned-in subtitles of the same episode read back by `hardsub_ocr.py`: when each line appears and leaves the screen, how alike the cutting is, and the character error rate. |
 | `hardsub_ocr.py` | Burned-in subtitles back out of the picture: samples the scan band, groups near-identical frames, OCRs one frame per group, removes watermarks, merges runs into cues and refines every boundary at the native frame rate. Standalone: `python hardsub_ocr.py ep.mp4 --lang ch`. |
 | `translate_srt_deepseek.py` | `.srt` in, `.vi.srt` out via the DeepSeek API, cleaning OCR junk first. `--dry-run` shows the cleaning decisions with no API key. |
 
@@ -260,6 +318,7 @@ python speakers.py episode.srt --show-lines
 python adapt_srt.py --srt episode.srt --dry-run
 python video_dub.py --video ep.mp4 --dub dub.wav --output ep_vn.mp4
 python transcribe_video.py --video ep.mp4 --output ep_vi.srt
+python eval_subtitles.py --ref ep.ocr.srt --hyp ep.src.srt
 python hardsub_ocr.py ep.mp4 -o ep.srt --lang ch
 python translate_srt_deepseek.py ep.srt --dry-run
 ```
@@ -270,14 +329,16 @@ No GPU, no model download, no API key — the model and the translation provider
 are both stubbed:
 
 ```bash
-python test_transcribe.py          # cue shaping: 14 checks
+python test_transcribe.py          # cue shaping, timing, translation budgets: 42 checks
+python test_eval_subtitles.py      # the accuracy scorer: 6 checks
 python test_worker_transcribe.py   # transcribe_job orchestration: 8 checks
 python test_worker_hardsub.py      # hardsub_job orchestration: 15 checks
 python test_vieneu_worker.py       # the studio worker: 38 checks
 ```
 
-Cue shaping is where the edge cases actually live, and all three of these came
-out of writing those tests rather than out of review:
+Cue shaping is where the edge cases actually live, and all four of these came
+out of writing those tests — the last one out of an episode's worth of Chinese
+cues that were six seconds long and one line of translation each:
 
 - **Padding may only consume silence.** Consecutive words inside a sentence are
   contiguous — one's end is the next one's start — so nudging every cue outwards
@@ -288,6 +349,10 @@ out of writing those tests rather than out of review:
 - **Words the aligner could not place arrive with the keys missing**, not null —
   numerals and foreign names do it constantly. They still have to be spoken, so
   they take the timing of whatever surrounds them rather than being dropped.
+- **A cue's size belongs to its script.** Limits tuned for Latin text (84
+  characters, 6 seconds) never bind on Chinese before the clock does, so cues
+  became six-second blocks cut wherever time ran out — mid-sentence, even
+  mid-word — and each translated into a paragraph.
 
 The orchestration tests run `transcribe_job` and `hardsub_job` against a fake
 Supabase, and the property they exist to hold is that a requeued job never pays
