@@ -168,6 +168,27 @@ def clean_cues(cues: list[Cue], confidences: dict[int, float], *, min_confidence
 
 
 # ---------------------------------------------------------------- 2. translate
+SOURCE_NAMES = {"zh": "Chinese", "ch": "Chinese", "zh-tw": "Chinese", "en": "English",
+                "ja": "Japanese", "ko": "Korean"}
+
+# How a Vietnamese audience expects names from each source language. Chinese names have a
+# Sino-Vietnamese reading everyone uses; Korean and Japanese names do not — a Korean hero
+# called by a Sino-Vietnamese reading of his hanja is a name no viewer knows him by. Korean
+# forms of address are relationships, and Vietnamese says those with its own pronouns.
+NAME_RULES = {
+    "Chinese": "render Chinese personal names in Sino-Vietnamese (曼云 -> Mạn Vân, 凤凰 -> Phượng Hoàng)",
+    "Korean": ("keep Korean personal names in their usual romanization, family name first "
+               "(김지원 -> Kim Ji-won, 이서준 -> Lee Seo-joon); forms of address such as 오빠, 언니, 형, "
+               "누나, 선배 become Vietnamese xưng hô (anh, chị, tiền bối ...), never transliterations"),
+    "Japanese": "keep Japanese personal names in Hepburn romanization (田中 -> Tanaka)",
+}
+DEFAULT_NAME_RULE = "write names the way Vietnamese audiences usually see them"
+
+
+def name_rule(source_name: str) -> str:
+    return NAME_RULES.get(source_name, DEFAULT_NAME_RULE)
+
+
 SYSTEM_PROMPT = """You are a professional subtitle translator for the Vietnamese dubbing of {source_name} short dramas (短剧).
 Translate every cue from {source_name} into natural, spoken Vietnamese — what the character would actually say when dubbed, not a literal rendering.
 
@@ -175,7 +196,7 @@ Rules
 - Reply with JSON only, exactly this shape: {{"cues": [{{"i": 12, "vi": "..."}}, ...]}} — one entry per input cue, same "i" values, same order. Never merge, split, drop or add cues, never leave "vi" empty.
 - Each cue has "sec", its on-screen duration. Keep the Vietnamese speakable in that time: about as many Vietnamese syllables as the source has characters, short colloquial phrasing, no padding.
 - Keep forms of address (xưng hô: anh/em, tôi/cô, ông/tôi, mày/tao, ...) consistent for each pair of characters across the whole episode; infer the relationship from context and keep it stable. Use the "context" cues (already translated) to stay consistent with what came before.
-- Names, nicknames, titles, places and organisations: use the glossary exactly as given; otherwise render Chinese names in Sino-Vietnamese and keep them identical every time.
+- Names, nicknames, titles, places and organisations: use the glossary exactly as given; otherwise {name_rule}, and keep them identical every time.
 - Plain text only: no translator notes, no brackets, no quotation marks around a line, no explanations. Keep the sentence-final tone (questions, exclamations) and translate interjections naturally (啊 -> à / hả / ơi as fits).
 - If a cue is an OCR fragment that makes no sense, still give the most plausible short line.
 {style}"""
@@ -241,8 +262,9 @@ def translate_cues(cues: list[Cue], client: DeepSeek, *, language: str, source: 
     `flush`, if given, is called with each chunk's {index: translation} as soon as that chunk is
     back from the API — the Dub Factory worker persists per chunk so a run that dies halfway
     keeps what it already paid for. The CLI does not need it: one file is one write."""
-    source_name = {"zh": "Chinese", "ch": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean"}.get(source, source)
+    source_name = SOURCE_NAMES.get(source, source)
     system = SYSTEM_PROMPT.format(source_name=source_name, language=language,
+                                  name_rule=name_rule(source_name),
                                   style=("Style notes from the producer: " + style) if style else "")
     out: dict[int, str] = {}
     failed: list[int] = []
@@ -290,8 +312,8 @@ def translate_cues(cues: list[Cue], client: DeepSeek, *, language: str, source: 
 
 # ---------------------------------------------------------------- glossary
 GLOSSARY_PROMPT = """You prepare a translation glossary for the Vietnamese dubbing of a {source_name} short drama.
-From the subtitle lines below, list every recurring proper noun: character names and nicknames, forms of address that work like names (e.g. 老板, 哥), titles, places, organisations, codenames, product or brand names.
-For each give ONE fixed Vietnamese rendering: Sino-Vietnamese for Chinese personal names (曼云 -> Mạn Vân, 凤凰 -> Phượng Hoàng), the usual Vietnamese name for real places, the sense in Vietnamese for descriptive codenames.
+From the subtitle lines below, list every recurring proper noun: character names and nicknames, forms of address that work like names (e.g. 老板, 哥, 사장님, 오빠), titles, places, organisations, codenames, product or brand names.
+For each give ONE fixed Vietnamese rendering: {name_rule}; the usual Vietnamese name for real places; the sense in Vietnamese for descriptive codenames.
 Reply with JSON only: {{"glossary": {{"<source term>": "<Vietnamese>", ...}}}}.  Omit ordinary words."""
 
 
@@ -312,8 +334,9 @@ def glossary_from_lines(texts: list[str], client: DeepSeek, *, source: str, max_
             seen.add(t)
             lines.append(t)
     lines = lines[:max_lines]
-    source_name = {"zh": "Chinese", "ch": "Chinese"}.get(source, source)
-    data = client.json_call(GLOSSARY_PROMPT.format(source_name=source_name),
+    source_name = SOURCE_NAMES.get(source, source)
+    data = client.json_call(GLOSSARY_PROMPT.format(source_name=source_name,
+                                                   name_rule=name_rule(source_name)),
                             "Subtitle lines (json list):\n" + json.dumps(lines, ensure_ascii=False),
                             max_tokens=4000)
     gl = data.get("glossary", {}) if isinstance(data, dict) else {}

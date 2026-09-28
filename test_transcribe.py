@@ -446,6 +446,416 @@ def _():
         assert "this one does not" in back[-1].text, back[-1].text
 
 
+# ------------------------------------------------ Chinese, the way whisperx
+# returns it: every character — punctuation included — its own "word", and the
+# spaces Whisper writes between unpunctuated phrases dropped from the words
+# but still present in the segment text.
+
+ZH_PUNCT = "，。？！、；："
+
+
+def zh(text, start=0.0, per_char=0.2, space_pause=0.35, score=0.9):
+    spec, t = [], start
+    for ch in text:
+        if ch.isspace():
+            t += space_pause
+            continue
+        dur = 0.08 if ch in ZH_PUNCT else per_char
+        spec.append((ch, round(t, 3), round(t + dur, 3)))
+        t += dur
+    return segment(spec, score=score, text=text)
+
+
+def texts(cues):
+    return [c["text"] for c in cues]
+
+
+@check("zh: every sentence gets its own cue (the six-second-block bug)")
+def _():
+    # Three sentences spoken back to back. The Latin-tuned shaper glued them
+    # into one cue — a sentence end only cut once a cue held 28 characters,
+    # and anything under 12 characters was merged into the line before.
+    cues = T.shape_cues([zh("你怎么在这里？我来找你。你不该来的。")], language="zh")
+    assert_sane(cues, "zh sentences")
+    assert texts(cues) == ["你怎么在这里？", "我来找你。", "你不该来的。"], texts(cues)
+
+
+@check("zh: a longer scene is cut at clause marks, never across a sentence end")
+def _():
+    line = "我告诉你，这件事情跟你没有关系。你最好别管！不然的话，我对你不客气。"
+    cues = T.shape_cues([zh(line)], language="zh")
+    assert_sane(cues, "zh scene")
+    assert all(len(c["text"]) <= 16 for c in cues), texts(cues)
+    for c in cues:
+        # Every cue ends at punctuation, and a sentence end only ever ends one.
+        assert c["text"][-1] in "。！？，", f"cut mid-clause: {c['text']}"
+        assert not any(p in c["text"][:-1] for p in "。！？"), \
+            f"spans a sentence end: {c['text']}"
+    assert "".join(texts(cues)) == line, "text was lost or reordered"
+
+
+@check("zh: unpunctuated speech is cut at the phrase spaces Whisper wrote")
+def _():
+    cues = T.shape_cues([zh("你怎么在这里 我来找你 你不该来的")], language="zh")
+    assert_sane(cues, "zh spaces")
+    assert texts(cues) == ["你怎么在这里", "我来找你", "你不该来的"], texts(cues)
+
+
+@check("zh: a phrase space inside one cue is kept as a space")
+def _():
+    # A vocative and its sentence read as one subtitle line, the way burned-in
+    # Chinese subtitles write it: "曼云 我们走".
+    cues = T.shape_cues([zh("曼云 我们走吧", space_pause=0.1)], language="zh")
+    assert texts(cues) == ["曼云 我们走吧"], texts(cues)
+
+
+@check("zh: nothing ever exceeds one 16-character line, even with no cues at all")
+def _():
+    line = "我们今天晚上一起去看电影然后吃火锅再去唱歌最后回家睡觉明天早上八点起床去上班"
+    cues = T.shape_cues([zh(line)], language="zh")
+    assert_sane(cues, "zh run-on")
+    assert all(len(c["text"]) <= 16 for c in cues), texts(cues)
+    assert "".join(texts(cues)) == line
+
+
+@check("zh: no cue is cut inside a word (with jieba installed)")
+def _():
+    try:
+        import jieba
+    except ImportError:
+        print("          (skipped: jieba not installed)")
+        return
+    line = "我们今天晚上一起去看电影然后吃火锅怎么样"
+    cues = T.shape_cues([zh(line)], language="zh")
+    edges, pos = set(), 0
+    for piece in jieba.lcut(line):
+        pos += len(piece)
+        edges.add(pos)
+    pos = 0
+    for c in cues[:-1]:
+        pos += len(c["text"])
+        assert pos in edges, f"cut inside a word at {pos}: {texts(cues)}"
+
+
+@check("zh: punctuation is never a cue of its own nor split from its word")
+def _():
+    line = "他说：“走吧。”好！你呢？"
+    cues = T.shape_cues([zh(line)], language="zh")
+    assert_sane(cues, "zh punct")
+    for c in cues:
+        assert c["text"][0] not in "，。？！：”", f"starts with punctuation: {c['text']}"
+        assert c["text"][-1] != "“", f"ends with an opening quote: {c['text']}"
+    assert "".join(texts(cues)) == line
+
+
+@check("zh: a passage the aligner gave up on is cut at estimated times, flagged")
+def _():
+    text = ("我告诉你，这件事情跟你没有关系。你最好别管！不然的话，我对你不客气。"
+            "你听明白了吗？")
+    seg = segment([], start=10.0, end=22.0, text=text)
+    cues = T.shape_cues([seg], language="zh")
+    assert_sane(cues, "zh unaligned")
+    assert len(cues) >= 4, texts(cues)
+    assert all(len(c["text"]) <= 16 for c in cues), texts(cues)
+    assert all(c["low_confidence"] and "estimated" in (c["note"] or "")
+               for c in cues), cues
+    assert "".join(texts(cues)) == text
+    assert cues[0]["start_ms"] >= 9_800 and cues[-1]["end_ms"] <= 22_500, cues
+
+
+# ----------------------------------------------------------------- timing
+
+@check("a cue appears just before its first word and lingers after its last")
+def _():
+    seg = zh("你好，我是小明。", start=1.0)
+    speech_end = seg["words"][-2]["end"]          # 明; the 。 after it is silence
+    cues = T.shape_cues([seg, zh("再见。", start=6.0)], language="zh")
+    assert len(cues) == 2, cues
+    assert cues[0]["start_ms"] == 900, cues[0]    # a 0.1 s lead-in
+    assert cues[0]["end_ms"] == round((speech_end + T.LAG_OUT_SECONDS) * 1000), cues[0]
+
+
+@check("a short gap between two lines is closed to two frames")
+def _():
+    segs = [zh("你好。", start=1.0), zh("再见。", start=2.1)]
+    cues = T.shape_cues(segs, language="zh")
+    assert len(cues) == 2, cues
+    gap = cues[1]["start_ms"] - cues[0]["end_ms"]
+    assert gap == round(T.MIN_GAP_SECONDS * 1000), (gap, cues)
+
+
+@check("a cue never appears before the previous line's speech has ended")
+def _():
+    # 0.03 s between two sentences: the second may not borrow a lead-in from
+    # time the first is still being spoken in.
+    seg = zh("你好。", start=1.0)
+    seg2 = zh("我是小明。", start=1.43)
+    cues = T.shape_cues([seg, seg2], language="zh")
+    assert len(cues) == 2, cues
+    assert cues[1]["start_ms"] >= 1400, cues             # 你好 ends at 1.4 s
+    assert cues[1]["start_ms"] <= 1430, cues             # and not after 我 starts
+    assert cues[0]["end_ms"] <= cues[1]["start_ms"]
+
+
+@check("the audio track's start offset is measured from the container")
+def _():
+    import json as _json
+    import subprocess
+
+    def probe(audio, video):
+        streams = [{"codec_type": "video", "start_time": str(video)},
+                   {"codec_type": "audio", "start_time": str(audio)}]
+        return type("R", (), {"stdout": _json.dumps({"streams": streams})})()
+
+    old_which, old_run = T.shutil.which, T.subprocess.run
+    T.shutil.which = lambda name: "/usr/bin/ffprobe"
+    try:
+        for audio, video, want in ((0.3, 0.0, 0.3), (0.0, 0.1, 0.0),
+                                   (0.01, 0.0, 0.0), (0.5, 0.2, 0.3)):
+            T.subprocess.run = lambda *a, **k: probe(audio, video)
+            got = T.media_offset("x.mp4")
+            assert abs(got - want) < 1e-6, (audio, video, got)
+        T.shutil.which = lambda name: None
+        assert T.media_offset("x.mp4") == 0.0
+    finally:
+        T.shutil.which, T.subprocess.run = old_which, old_run
+    assert subprocess.run is old_run
+
+
+@check("timings are moved onto the video's timeline, words included")
+def _():
+    segs = [{"start": 1.0, "end": 2.0, "text": "hi",
+             "words": [{"word": "hi", "start": 1.0, "end": 1.5}]}]
+    T._shift(segs, 0.25)
+    assert segs[0]["start"] == 1.25 and segs[0]["words"][0]["end"] == 1.75, segs
+
+
+# --------------------------------------------------------------- ASR text
+
+@check("Whisper's credits hallucinations and prompt echoes are dropped")
+def _():
+    prompt = T.ASR_PROMPTS["zh"]
+    segs = [{"text": "字幕由Amara.org社区提供"},
+            {"text": "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目"},
+            {"text": "以下是普通话的对白"},
+            {"text": "你今天去哪里了？我到处找你。"},
+            {"text": "我们一起订阅了那本杂志，然后转发给了所有同事，"
+                     "大家都说写得很好，我觉得你也应该看看，真的很不错。"}]
+    kept = T._drop_junk_segments(segs, prompt, log=lambda m: None)
+    assert [s["text"][:4] for s in kept] == ["你今天去", "我们一起"], kept
+
+
+@check("the ASR prompt: auto by language, custom as given, or off")
+def _():
+    assert T._asr_prompt("auto", "zh") == T.ASR_PROMPTS["zh"]
+    assert T._asr_prompt(None, "zh") == T.ASR_PROMPTS["zh"]
+    assert T._asr_prompt("auto", "en") is None
+    assert T._asr_prompt("off", "zh") is None and T._asr_prompt(False, "zh") is None
+    assert T._asr_prompt("林小雨，陆景深。", "zh") == "林小雨，陆景深。"
+
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Options:
+        beam_size: int = 5
+        initial_prompt: str | None = None
+
+    model = type("M", (), {})()
+    model.options = Options()
+    assert T._set_initial_prompt(model, "提示。")
+    assert model.options.initial_prompt == "提示。" and model.options.beam_size == 5
+    assert not T._set_initial_prompt(type("N", (), {})(), "x")
+
+
+@check("saved word timings re-cut to exactly the same cues")
+def _():
+    import json as _json
+    segs = [zh("你怎么在这里？我来找你。", start=2.0),
+            zh("你不该来的。", start=6.0)]
+    segs[0]["words"][3]["score"] = float("nan")
+    saved = _json.loads(_json.dumps(T.words_json(
+        {"language": "zh", "alignment": "word", "segments": segs,
+         "duration": 8.0, "offset": 0.0})))
+    assert saved["segments"][0]["words"][3].get("score") is None
+    a = T.shape_cues(segs, language="zh")
+    b = T.shape_cues(saved["segments"], language="zh")
+    assert [(c["start_ms"], c["end_ms"], c["text"]) for c in a] == \
+           [(c["start_ms"], c["end_ms"], c["text"]) for c in b]
+
+
+# ------------------------------------------------------------ translation
+
+def _prompt_client(reply):
+    """A client that records every prompt and answers with reply(idx, prompt)."""
+    import json as _json
+
+    class Client:
+        name, model = "fake", "fake-1"
+        prompts = []
+
+        def complete(self, system, prompt):
+            Client.prompts.append(prompt)
+            idxs = [int(l.split("]")[0][1:]) for l in prompt.splitlines()
+                    if l.startswith("[")]
+            return _json.dumps({"cues": [{"index": i, "text": reply(i, prompt)}
+                                         for i in idxs]})
+    return Client
+
+
+@check("each cue goes to the translator with its duration and a length budget")
+def _():
+    import adapt_srt as A
+    Client = _prompt_client(lambda i, p: f"vi{i}")
+    old = A.make_client
+    A.make_client = lambda p, m: Client()
+    try:
+        cues = [{"idx": 1, "text": "你好", "start_ms": 0, "end_ms": 2000},
+                {"idx": 2, "text": "再见", "start_ms": 3000, "end_ms": 3600}]
+        T.translate_cues(cues, language="Vietnamese", log=lambda m: None)
+        first = Client.prompts[0]
+        assert "[1] (2.0s, max 34 chars) 你好" in first, first
+        # 0.6 s x 17 cps is 10 characters, but no line is budgeted below half
+        # a display line: a short cue still needs room for a whole thought.
+        assert "[2] (0.6s, max 21 chars) 再见" in first, first
+        assert T.char_budget(10, "Vietnamese") == 84      # never past two lines
+        assert T.char_budget(2, "Chinese") == 18
+    finally:
+        A.make_client = old
+
+
+@check("an over-long translation is condensed once, and only a shorter one kept")
+def _():
+    import adapt_srt as A
+    long_vi = "Anh không nên đến đây vào lúc này, ở đây rất nguy hiểm cho anh và cả gia đình anh nữa"
+
+    def reply(i, prompt):
+        if prompt.startswith("These Vietnamese subtitle translations are too long"):
+            return "Anh không nên đến, ở đây nguy hiểm." if i == 1 else long_vi + " nữa"
+        return long_vi
+    Client = _prompt_client(reply)
+    old = A.make_client
+    A.make_client = lambda p, m: Client()
+    try:
+        flushed = []
+        cues = [{"idx": 1, "text": "你不该来的，这里很危险", "start_ms": 0, "end_ms": 2000},
+                {"idx": 2, "text": "你不该来的，这里很危险", "start_ms": 3000, "end_ms": 5000}]
+        out = T.translate_cues(cues, language="Vietnamese", log=lambda m: None,
+                               flush=flushed.append)
+        assert out[1] == "Anh không nên đến, ở đây nguy hiểm.", out
+        assert out[2] == long_vi, "a longer 'condensed' line must not replace the original"
+        assert any(1 in b and b[1] == out[1] for b in flushed), flushed
+        assert sum(p.startswith("These Vietnamese") for p in Client.prompts) == 1
+    finally:
+        A.make_client = old
+
+
+@check("later batches see earlier cues with the translation chosen for them")
+def _():
+    import adapt_srt as A
+    Client = _prompt_client(lambda i, p: f"vi{i}")
+    old = A.make_client
+    A.make_client = lambda p, m: Client()
+    try:
+        cues = [{"idx": i, "text": f"句子{i}"} for i in range(1, 31)]
+        T.translate_cues(cues, language="Vietnamese", log=lambda m: None)
+        second = Client.prompts[1]
+        assert "CONTEXT [25]: 句子25  =>  vi25" in second, second
+    finally:
+        A.make_client = old
+
+
+# ------------------------------------------------------------------- srt
+
+@check("a long Vietnamese line is wrapped in two at a natural break")
+def _():
+    text = "Anh không nên đến đây vào lúc này, ở đây rất nguy hiểm cho anh"
+    out = T.wrap_text(text, 42)
+    top, bottom = out.split("\n")
+    assert len(top) <= 42 and len(bottom) <= 42, out
+    assert top.endswith(","), f"should break after the comma: {out!r}"
+    assert T.wrap_text("Anh làm gì ở đây?", 42) == "Anh làm gì ở đây?"
+    zh_out = T.wrap_text("我告诉你这件事情跟你没有关系，你最好别管这件事", 16, spaced=False)
+    assert zh_out.split("\n")[0].endswith("，"), zh_out
+
+
+@check("a wrapped .srt still parses back to the same text")
+def _():
+    import tempfile
+    from pathlib import Path
+    import srt_dub as S
+
+    cues = [{"idx": 1, "start_ms": 0, "end_ms": 3000, "text": "x"}]
+    vi = "Anh không nên đến đây vào lúc này, ở đây rất nguy hiểm cho anh"
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "vi.srt"
+        T.write_srt(cues, path, {1: vi}, wrap="Vietnamese")
+        raw = path.read_text(encoding="utf-8")
+        assert raw.count("\n") >= 5, raw           # the text took two lines
+        assert S.parse_srt(str(path))[0].text == vi
+
+
+@check("shape numbers describe the cues")
+def _():
+    cues = T.shape_cues([zh("你怎么在这里？我来找你。你不该来的。")], language="zh")
+    st = T.shape_stats(cues, "zh")
+    assert st["profile"] == "han" and st["cue_chars_max"] <= 16, st
+    assert st["cues_over_limit"] == 0 and st["cues_estimated"] == 0, st
+
+
+@check("zh: Whisper's half-width punctuation is set full-width, numbers untouched")
+def _():
+    cues = T.shape_cues([zh("你好,我是谁?")], language="zh")
+    assert texts(cues) == ["你好，我是谁？"], texts(cues)
+    assert T._full_width("他花了1,000块。OK?") == "他花了1,000块。OK?"
+
+
+# ------------------------------------------------------------------ Korean
+
+def ko(sentences, start=0.0, per_syllable=0.14, gap=0.1, score=0.9):
+    """Korean the way whisperx returns it: spaced words, Whisper's own
+    punctuation, one aligned segment per sentence."""
+    segs, t = [], start
+    for sentence in sentences:
+        spec = []
+        for w in sentence.split():
+            d = per_syllable * sum(1 for ch in w if "\uac00" <= ch <= "\ud7a3")
+            spec.append((w, round(t, 3), round(t + d, 3)))
+            t += d + 0.03
+        segs.append(segment(spec, score=score, text=sentence))
+        t += gap
+    return segs
+
+
+@check("ko: every sentence is its own cue, one-syllable ones included")
+def _():
+    lines = ["너 여기서 뭐해?", "네.", "너 찾으러 왔어.", "오지 말았어야지."]
+    cues = T.shape_cues(ko(lines, gap=0.35), language="ko")
+    assert_sane(cues, "ko sentences")
+    assert texts(cues) == lines, texts(cues)
+
+
+@check("ko: a long sentence is cut at its comma, and every cue fits 22 characters")
+def _():
+    lines = ["그날 밤에 있었던 일은, 네가 생각하는 거랑 전혀 다르고 나도 어쩔 수 없었어."]
+    cues = T.shape_cues(ko(lines), language="ko")
+    assert_sane(cues, "ko long")
+    assert len(cues) >= 2 and all(len(c["text"]) <= 22 for c in cues), texts(cues)
+    assert texts(cues)[0].endswith(","), texts(cues)
+    assert " ".join(texts(cues)) == lines[0]
+
+
+@check("a one-syllable sentence ends a cue in Korean and Chinese; an initial does not")
+def _():
+    assert T._ends_sentence("네.") and T._ends_sentence("好.") and T._ends_sentence("응?")
+    assert not T._ends_sentence("J.") and not T._ends_sentence("Mr.")
+
+
+@check("the translator is told how Chinese, Korean and Japanese names are written")
+def _():
+    rules = T.SYSTEM.replace("{language}", "Vietnamese")
+    assert "Lâm Tiểu Vũ" in rules and "Kim Ji-won" in rules and "Tanaka" in rules
+
+
 def run():
     failed = 0
     for name, fn in checks:

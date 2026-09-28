@@ -45,6 +45,7 @@ Run:
 
 import argparse
 import io
+import json
 import logging
 import os
 import platform
@@ -719,6 +720,16 @@ def require_columns(sb, job, *columns):
             f"migrations/20260818_transcribe_jobs.sql in the SQL editor")
 
 
+def _number(value, kind=float):
+    """A numeric job setting, or None when it is absent, blank or not a number."""
+    if value in (None, ""):
+        return None
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def transcribe_job(sb, job):
     """Media in, translated subtitles out.
 
@@ -776,6 +787,7 @@ def transcribe_job(sb, job):
     language = prior.get("source_language")
     alignment = prior.get("alignment")
     duration = prior.get("audio_seconds")
+    shaping = prior.get("shaping")
 
     if complete:
         log(sb, job, "transcribing",
@@ -816,6 +828,11 @@ def transcribe_job(sb, job):
             source_language=source,
             align=bool(settings.get("align_words", True)),
             vad_method=settings.get("vad_method", T.VAD_METHOD),
+            # "auto" gives Mandarin a punctuated Simplified style sample; a
+            # job may carry its own (character names help), or "off".
+            prompt=settings.get("asr_prompt", "auto"),
+            isolate=bool(settings.get("isolate_vocals", False)),
+            workdir=work,
             log=_asr_log,
             tick=lambda pct: touch_job(
                 sb, job, detail=f"transcribing — {pct:.0f}%"),
@@ -825,13 +842,33 @@ def transcribe_job(sb, job):
         if not result["segments"]:
             raise RuntimeError("no speech found in this file")
 
+        # Cue limits follow the script (T.PROFILES): a Chinese cue is one
+        # 16-character line, an English one two lines of 42. A job only sets
+        # these to override that, so absent means "by script", not 84/6.
         cues = T.shape_cues(
             result["segments"], language=language,
-            max_seconds=float(settings.get("max_cue_seconds", T.MAX_CUE_SECONDS)),
-            max_chars=int(settings.get("max_cue_chars", T.MAX_CUE_CHARS)))
+            max_seconds=_number(settings.get("max_cue_seconds")),
+            max_chars=_number(settings.get("max_cue_chars"), int))
         if not cues:
             raise RuntimeError(
                 "nothing survived cue shaping — this file may be music only")
+        shaping = {**T.shape_stats(cues, language),
+                   **{k: result[k] for k in ("offset", "prompt", "vocals",
+                                             "words", "words_timed",
+                                             "segments_unaligned")
+                      if result.get(k) not in (None, "", 0, False)}}
+
+        # The word-level result, so these cues can be re-cut later — by a
+        # better cutter, or for an accuracy check against burned-in
+        # subtitles — without paying for the GPU half again. Optional: a
+        # failed upload costs that convenience, not the job.
+        try:
+            upload_output(sb, f"{owner}/{job_id}/transcript.words.json",
+                          json.dumps(T.words_json(result),
+                                     ensure_ascii=False).encode("utf-8"),
+                          "application/json")
+        except Exception as e:
+            print(f"  (word timings not saved: {e})", flush=True)
 
         log(sb, job, "transcribing",
             f"Heard {len(cues)} line(s) of {language}, {alignment}-level timing",
@@ -841,7 +878,8 @@ def transcribe_job(sb, job):
         set_job(sb, job_id, total_cues=len(cues), done_cues=0,
                 qc_summary={"kind": "transcribe", "source_language": language,
                             "target_language": target, "alignment": alignment,
-                            "audio_seconds": duration, "cues_total": len(cues)})
+                            "audio_seconds": duration, "cues_total": len(cues),
+                            "shaping": shaping})
         for i in range(0, len(cues), 500):
             sb.table("cues").insert([{
                 "owner_id": owner, "job_id": job_id, "idx": c["idx"],
@@ -851,14 +889,14 @@ def transcribe_job(sb, job):
                 # job that fails mid-translation still holds a usable file.
                 "source_text": c["text"], "transcript_text": c["text"],
                 "status": "review" if c["low_confidence"] else "pending",
-                "note": ("low confidence transcription — check this line"
-                         if c["low_confidence"] else None),
+                "note": (c.get("note") or "low confidence transcription — "
+                         "check this line") if c["low_confidence"] else None,
             } for c in cues[i:i + 500]]).execute()
 
         # The source transcript is uploaded before translation is attempted, so
         # a missing API key costs the translation and nothing else.
         srt_src = work / "transcript.src.srt"
-        T.write_srt(cues, srt_src)
+        T.write_srt(cues, srt_src, wrap=language)
         src_path = f"{owner}/{job_id}/transcript.src.srt"
         upload_output(sb, src_path, srt_src.read_bytes(), "application/x-subrip")
         set_job(sb, job_id, transcript_src_path=src_path)
@@ -884,8 +922,12 @@ def transcribe_job(sb, job):
 
     translated = 0
     if pending:
+        # The times ride along: each cue's duration sets how much translation
+        # it can carry (T.char_budget), which is what keeps a two-second cue
+        # from coming back as a paragraph.
         probes = [{"idx": r["idx"], "text": r.get("transcript_text") or
-                   r["source_text"]} for r in pending]
+                   r["source_text"], "start_ms": r["start_ms"],
+                   "end_ms": r["end_ms"]} for r in pending]
         by_idx = {r["idx"]: r for r in pending}
 
         def persist(batch):
@@ -941,6 +983,7 @@ def transcribe_job(sb, job):
                 provider=settings.get("translate_provider",
                                       settings.get("adapt_provider", "auto")),
                 model=settings.get("translate_model"),
+                max_cps=_number(settings.get("max_cps")),
                 log=_tr_log,
                 tick=lambda: touch_job(sb, job, detail="translating"),
                 flush=persist)
@@ -973,7 +1016,7 @@ def transcribe_job(sb, job):
                  "end_ms": r["end_ms"], "text": r["source_text"]}
                 for r in sorted(rows, key=lambda r: r["idx"])]
     srt_out = work / "transcript.vi.srt"
-    T.write_srt(cues_out, srt_out)
+    T.write_srt(cues_out, srt_out, wrap=target)
     try:
         target_code = T.lang_code(target) or target[:2].lower()
     except ValueError:
@@ -994,6 +1037,15 @@ def transcribe_job(sb, job):
         "cues_needing_review": review,
         "srt_seconds": round(max((r["end_ms"] for r in rows), default=0) / 1000, 2),
     }
+    if shaping:
+        qc["shaping"] = shaping
+    budget = [(len(r["source_text"] or ""), T.char_budget(
+                  (r["end_ms"] - r["start_ms"]) / 1000, target,
+                  _number(settings.get("max_cps"))))
+              for r in rows if r.get("translated_at")]
+    over = sum(1 for n, b in budget if b and n > b * T.OVER_BUDGET)
+    if budget:
+        qc["lines_over_reading_speed"] = over
     fields = {"status": "done", "error": None, "srt_out_path": out_path,
               "done_cues": done_before + translated, "review_cues": review,
               "qc_summary": qc}

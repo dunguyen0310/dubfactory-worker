@@ -417,6 +417,10 @@ def _content_len(text: str) -> int:
 # the picture, not text.
 STROKE_CHARS = set("一二丨ー—–-_=~·•.,:;'\"`´ 　")
 
+# A one-character line is usually scene junk in Latin script, but in Chinese and
+# Korean it is often the whole reply — 好, 嗯, 네, 응, 왜 — and those read at 0.85-0.9.
+SINGLE_CJK_MIN_CONF = 0.85
+
 
 def _stroke_only(text: str) -> bool:
     return bool(text) and all(ch in STROKE_CHARS for ch in text)
@@ -504,7 +508,10 @@ class Ocr:
         # RapidOCR keeps the last use_det/use_cls/use_rec it was given, so after a
         # detect() call the flags must be set back explicitly.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            res = self.engine(img_bgr, use_det=True, use_cls=True, use_rec=True, unclip_ratio=self.unclip)
+            # No angle classifier: burned-in subtitles are never upside down, and the
+            # classifier (trained on Chinese and English) turns some Korean lines 180°
+            # before they are read — "내가 말했잖아" came back as "107", or not at all.
+            res = self.engine(img_bgr, use_det=True, use_cls=False, use_rec=True, unclip_ratio=self.unclip)
         if res is None or getattr(res, "boxes", None) is None or not len(res.boxes):
             return []
         h, w = img_bgr.shape[:2]
@@ -727,8 +734,11 @@ def filter_lines(lines: list[Line], min_duration: int) -> list[Line]:
         dur = ln.end_ms - ln.start_ms
         if n == 0:
             continue
-        if n == 1 and (ln.confidence < 0.95 or (not _is_cjk(ln.text.strip()[0]) and dur < 1000)):
-            continue
+        if n == 1:
+            first = next(ch for ch in ln.text if ch.isalnum() or _is_cjk(ch))
+            cjk = _is_cjk(first)
+            if ln.confidence < (SINGLE_CJK_MIN_CONF if cjk else 0.95) or (not cjk and dur < 1000):
+                continue
         if n < 3 and dur < max(600, 2 * min_duration):
             continue
         out.append(ln)
