@@ -214,7 +214,9 @@ writes as spaces in unpunctuated Chinese, then real pauses; never inside a word
 speech is scored and the cheapest wins, and a silence of a second always ends a
 cue. Mandarin is transcribed with a short punctuated Simplified style prompt,
 because punctuation is the best evidence of where a line ends and the aligner
-only knows Simplified characters.
+only knows Simplified characters. Korean needs no prompt — Whisper punctuates
+it unprompted — and its cues hold up to 22 characters, what two lines of
+Vietnamese can carry once translated.
 
 **When cues appear.** A cue comes up 0.1 s before its first word and stays
 0.35 s after its last, taking that time only from silence; it lasts at least a
@@ -283,6 +285,19 @@ Three things are its own:
   (`scan_preview.png`) are uploaded beside the subtitles. The preview is how
   you tell a wrong scan band from a video that has no subtitles.
 
+Korean (`ocr_lang: ko`) reads with PP-OCRv5's Korean model and needs one thing
+Chinese does not: PaddleOCR's text-angle classifier is never used. Trained on
+Chinese and English, it judges some Korean lines to be upside down and turns
+them over before they are read — a two-line subtitle lost a line and whole
+lines came back empty or as "107". Burned-in subtitles are never upside down,
+so it is off for every language (Chinese reads identically without it). A
+one-character line is kept at 0.85 confidence rather than 0.95 when it is
+Hangul or Han, because 네, 응, 好 and 嗯 are whole replies. The Korean model
+sometimes drops the space between two words (내가말했잖아); the translation
+reads through it. Korean names keep their usual romanization (Kim Ji-won) and
+Korean forms of address become Vietnamese ones — Chinese names alone take a
+Sino-Vietnamese reading.
+
 `settings` it reads: `language` (target, default Vietnamese), `ocr_lang`
 (`ch` = Chinese + English, `en`, `ko`, `ja`, `zh-tw`), `crop` (`x,y,w,h` in
 percent, or empty to find the band automatically), `brightness_min` (190),
@@ -329,8 +344,9 @@ No GPU, no model download, no API key — the model and the translation provider
 are both stubbed:
 
 ```bash
-python test_transcribe.py          # cue shaping, timing, translation budgets: 42 checks
-python test_eval_subtitles.py      # the accuracy scorer: 6 checks
+python test_transcribe.py          # cue shaping, timing, translation budgets: 47 checks
+python test_eval_subtitles.py      # the accuracy scorer and benchmark: 7 checks
+python test_hardsub_ocr.py         # OCR language handling, no models: 3 checks
 python test_worker_transcribe.py   # transcribe_job orchestration: 8 checks
 python test_worker_hardsub.py      # hardsub_job orchestration: 15 checks
 python test_vieneu_worker.py       # the studio worker: 38 checks

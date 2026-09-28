@@ -74,6 +74,12 @@ import srt_dub as S
 # speech actually comes in, and they recover the sentence ends Whisper often
 # writes as commas. It is also how burned-in Chinese subtitles are cut.
 #
+# Korean writes spaces and Whisper punctuates it unprompted, so its cues are
+# cut at sentence ends almost regardless of size (measured the same way: every
+# line within 0.5 s at any limit tried). The limit is set by the translation: a
+# Hangul syllable becomes about four Vietnamese characters, so 22 characters of
+# Korean — some 17 syllables and their spaces — is what two lines of 42 hold.
+#
 #   max_chars    hard ceiling on one cue's source text
 #   ideal_chars  what a cue aims for when a sentence could be cut either way
 #   min_chars    below this a cue starts to read as a flicker
@@ -86,7 +92,7 @@ PROFILES = {
             "max_seconds": 5.0, "line_chars": 16},
     "kana": {"max_chars": 20, "ideal_chars": 12, "min_chars": 3,
              "max_seconds": 5.0, "line_chars": 13},
-    "hangul": {"max_chars": 28, "ideal_chars": 16, "min_chars": 4,
+    "hangul": {"max_chars": 22, "ideal_chars": 12, "min_chars": 3,
                "max_seconds": 5.5, "line_chars": 16},
     "brahmic": {"max_chars": 60, "ideal_chars": 32, "min_chars": 6,
                 "max_seconds": 6.0, "line_chars": 35},
@@ -818,7 +824,10 @@ def _ends_sentence(text: str) -> bool:
         return False
     if core[-1] == "." and not core.endswith(".."):
         stem = core[:-1].lstrip("".join(OPENERS)).lower()
-        if stem in ABBREVIATIONS or (len(stem) == 1 and stem.isalpha()):
+        # An initial is one LATIN letter: "네." (yes) and "好." are sentences,
+        # and str.isalpha() says yes to every Hangul syllable and Hanzi.
+        if stem in ABBREVIATIONS or (len(stem) == 1 and stem.isascii()
+                                     and stem.isalpha()):
             return False
     return True
 
@@ -1301,8 +1310,10 @@ number, a negation or the point of the line.
 cue. Never merge two cues, split one, or move words between cues: each line \
 is on screen only while its own words are spoken. When a sentence runs across \
 several cues, translate each part so the parts read naturally in sequence.
-4. Write names the way {language} viewers expect them — Chinese names in \
-Vietnamese take their Sino-Vietnamese reading — and the same way every time.
+4. Write names the way {language} viewers expect them, and the same way \
+every time. In Vietnamese, Chinese names take their Sino-Vietnamese reading \
+(林小雨 -> Lâm Tiểu Vũ); Korean and Japanese names keep their usual \
+romanization (김지원 -> Kim Ji-won, 田中 -> Tanaka).
 5. Match the register of the original — casual speech stays casual, formal \
 stays formal.
 6. Keep numbers as digits. These are subtitles; a later step spells them out \

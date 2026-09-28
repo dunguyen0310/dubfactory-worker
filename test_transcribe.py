@@ -809,6 +809,53 @@ def _():
     assert T._full_width("他花了1,000块。OK?") == "他花了1,000块。OK?"
 
 
+# ------------------------------------------------------------------ Korean
+
+def ko(sentences, start=0.0, per_syllable=0.14, gap=0.1, score=0.9):
+    """Korean the way whisperx returns it: spaced words, Whisper's own
+    punctuation, one aligned segment per sentence."""
+    segs, t = [], start
+    for sentence in sentences:
+        spec = []
+        for w in sentence.split():
+            d = per_syllable * sum(1 for ch in w if "\uac00" <= ch <= "\ud7a3")
+            spec.append((w, round(t, 3), round(t + d, 3)))
+            t += d + 0.03
+        segs.append(segment(spec, score=score, text=sentence))
+        t += gap
+    return segs
+
+
+@check("ko: every sentence is its own cue, one-syllable ones included")
+def _():
+    lines = ["너 여기서 뭐해?", "네.", "너 찾으러 왔어.", "오지 말았어야지."]
+    cues = T.shape_cues(ko(lines, gap=0.35), language="ko")
+    assert_sane(cues, "ko sentences")
+    assert texts(cues) == lines, texts(cues)
+
+
+@check("ko: a long sentence is cut at its comma, and every cue fits 22 characters")
+def _():
+    lines = ["그날 밤에 있었던 일은, 네가 생각하는 거랑 전혀 다르고 나도 어쩔 수 없었어."]
+    cues = T.shape_cues(ko(lines), language="ko")
+    assert_sane(cues, "ko long")
+    assert len(cues) >= 2 and all(len(c["text"]) <= 22 for c in cues), texts(cues)
+    assert texts(cues)[0].endswith(","), texts(cues)
+    assert " ".join(texts(cues)) == lines[0]
+
+
+@check("a one-syllable sentence ends a cue in Korean and Chinese; an initial does not")
+def _():
+    assert T._ends_sentence("네.") and T._ends_sentence("好.") and T._ends_sentence("응?")
+    assert not T._ends_sentence("J.") and not T._ends_sentence("Mr.")
+
+
+@check("the translator is told how Chinese, Korean and Japanese names are written")
+def _():
+    rules = T.SYSTEM.replace("{language}", "Vietnamese")
+    assert "Lâm Tiểu Vũ" in rules and "Kim Ji-won" in rules and "Tanaka" in rules
+
+
 def run():
     failed = 0
     for name, fn in checks:
